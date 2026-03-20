@@ -1,0 +1,14 @@
+# 起動時に自動接続する接続名（省略時: 毎回選択）
+default_connection: "local myapp"
+
+# true: default_connection に自動接続
+auto_connect: false
+
+# SELECT に LIMIT がない場合に付与する件数（0: 無効）
+default_limit: 100
+
+# 接続タイムアウト（秒）
+connect_timeout: 5
+
+# 結果の最大表示行数
+result_limit: 500

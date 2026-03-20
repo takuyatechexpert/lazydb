@@ -1,0 +1,39 @@
+# Direct 接続
+- name: local
+  label: local
+  type: direct
+  host: 127.0.0.1
+  port: 5432
+  database: myapp_dev
+  user: postgres
+  password: "env:PGPASSWORD"        # env:VAR / prompt / 平文
+
+# SSH トンネル
+- name: staging
+  label: stg
+  type: ssh
+  readonly: true
+  ssh_host: bastion-stg             # ~/.ssh/config の Host エイリアス可
+  # ssh_user: ec2-user              # 省略時は SSH config に委譲
+  remote_db_host: db.example.internal
+  remote_db_port: 5432
+  local_port: 15432
+  database: staging_db
+  user: postgres
+  password: "prompt"                # 起動時に対話入力
+
+# AWS SSM トンネル
+- name: production
+  label: prd
+  type: ssm
+  readonly: true
+  instance_id: i-XXXXXXXXXXXXXXXXX
+  ssh_user: ec2-user
+  ssh_key: ~/.ssh/id_rsa
+  aws_profile: my-profile
+  remote_db_host: db.example.internal
+  remote_db_port: 5432
+  local_port: 15433
+  database: prod_db
+  user: postgres
+  password: "prompt"
