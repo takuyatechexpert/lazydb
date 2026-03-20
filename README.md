@@ -14,28 +14,8 @@
 
 ## インストール
 
-### Homebrew (macOS / Linux)
-
 ```bash
 brew install takuyatechexpert/tap/lazydb
-```
-
-### バイナリダウンロード
-
-[GitHub Releases](https://github.com/takuyatechexpert/lazydb/releases) からプラットフォーム別のバイナリをダウンロード:
-
-```bash
-# macOS (Apple Silicon)
-curl -LO https://github.com/takuyatechexpert/lazydb/releases/latest/download/lazydb-aarch64-apple-darwin.tar.gz
-tar xzf lazydb-aarch64-apple-darwin.tar.gz
-sudo mv lazydb /usr/local/bin/
-```
-
-### ソースからビルド
-
-```bash
-# Rust ツールチェインが必要
-cargo install --path .
 ```
 
 ## 使い方
