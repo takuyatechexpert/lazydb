@@ -44,6 +44,12 @@ lazydb exec -c local -f query.sql --format json
 
 # 接続一覧を表示
 lazydb list-connections
+
+# パスワードを OS キーチェーンに保存
+lazydb set-password local
+
+# パスワードを OS キーチェーンから削除
+lazydb delete-password local
 ```
 
 ## 設定
@@ -58,7 +64,7 @@ lazydb list-connections
   port: 5432
   database: mydb
   user: postgres
-  password: "env:PGPASSWORD"   # env:VAR / prompt / 平文
+  password: "keychain:local"   # keychain:NAME / env:VAR / prompt / 平文
 
 - type: ssh
   name: staging-db

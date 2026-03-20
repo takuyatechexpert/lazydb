@@ -47,10 +47,11 @@ impl ConnectionConfig {
 }
 
 /// パスワード値を解決する
-///   None        → .pgpass に委譲
-///   "prompt"    → 対話入力（マスク表示）
-///   "env:VAR"   → 環境変数から取得
-///   それ以外    → そのまま使用
+///   None             → .pgpass に委譲
+///   "prompt"         → 対話入力（マスク表示）
+///   "env:VAR"        → 環境変数から取得
+///   "keychain:NAME"  → OS キーチェーンから取得（macOS Keychain / Linux Secret Service）
+///   それ以外         → そのまま使用
 fn resolve_password_value(value: Option<&str>) -> Result<Option<String>> {
     match value {
         None => Ok(None),
@@ -65,8 +66,52 @@ fn resolve_password_value(value: Option<&str>) -> Result<Option<String>> {
                 .with_context(|| format!("環境変数 {} が設定されていません", var_name))?;
             Ok(Some(val))
         }
+        Some(s) if s.starts_with("keychain:") => {
+            let conn_name = &s[9..];
+            get_keychain_password(conn_name)
+        }
         Some(s) => Ok(Some(s.to_string())),
     }
+}
+
+const KEYCHAIN_SERVICE: &str = "lazydb";
+
+/// OS キーチェーンからパスワードを取得する
+fn get_keychain_password(conn_name: &str) -> Result<Option<String>> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, conn_name)
+        .context("キーチェーンエントリの作成に失敗しました")?;
+    match entry.get_password() {
+        Ok(pw) => Ok(Some(pw)),
+        Err(keyring::Error::NoEntry) => {
+            anyhow::bail!(
+                "キーチェーンにパスワードが登録されていません: {}\n\
+                 登録コマンド: lazydb set-password {}",
+                conn_name,
+                conn_name
+            )
+        }
+        Err(e) => anyhow::bail!("キーチェーンからの取得に失敗しました: {}", e),
+    }
+}
+
+/// OS キーチェーンにパスワードを保存する
+pub fn set_keychain_password(conn_name: &str, password: &str) -> Result<()> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, conn_name)
+        .context("キーチェーンエントリの作成に失敗しました")?;
+    entry
+        .set_password(password)
+        .with_context(|| format!("キーチェーンへの保存に失敗しました: {}", conn_name))?;
+    Ok(())
+}
+
+/// OS キーチェーンからパスワードを削除する
+pub fn delete_keychain_password(conn_name: &str) -> Result<()> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, conn_name)
+        .context("キーチェーンエントリの作成に失敗しました")?;
+    entry
+        .delete_credential()
+        .with_context(|| format!("キーチェーンからの削除に失敗しました: {}", conn_name))?;
+    Ok(())
 }
 
 /// connections.yml を読み込む（ファイルがなければ空リストを返す）
@@ -92,7 +137,7 @@ pub fn load_connections(config_path: Option<&str>) -> Result<Vec<ConnectionConfi
     Ok(connections)
 }
 
-/// 接続設定を connections.yml に追記する
+/// 接続設定を connections.yml に追記する（既存内容・コメントを保持）
 pub fn save_connection(conn: &ConnectionConfig) -> Result<()> {
     let path = expand_tilde("~/.config/lazydb/connections.yml");
 
@@ -102,24 +147,114 @@ pub fn save_connection(conn: &ConnectionConfig) -> Result<()> {
             .with_context(|| format!("ディレクトリを作成できません: {:?}", parent))?;
     }
 
-    // 既存の接続を読み込み
-    let mut connections = if path.exists() {
-        let content = std::fs::read_to_string(&path)?;
-        serde_yaml::from_str::<Vec<ConnectionConfig>>(&content).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    // 新しい接続エントリを手書き YAML で生成（serde_yaml で全体を書き直さない）
+    let entry_yaml = connection_to_yaml(conn);
 
-    connections.push(conn.clone());
+    // 既存ファイルの末尾に追記
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("接続設定ファイルを開けません: {}", path.display()))?;
 
-    let yaml = serde_yaml::to_string(&connections)
-        .context("接続設定のシリアライズに失敗しました")?;
-    std::fs::write(&path, yaml)
+    // 既存ファイルが空でなく改行で終わっていない場合は改行を追加
+    if path.exists() {
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        if !existing.is_empty() && !existing.ends_with('\n') {
+            writeln!(file)?;
+        }
+    }
+
+    write!(file, "{}", entry_yaml)
         .with_context(|| format!("接続設定ファイルに書き込めません: {}", path.display()))?;
 
     ensure_secure_permissions(&path);
 
     Ok(())
+}
+
+/// ConnectionConfig を手書き YAML 文字列に変換（コメント保持のため serde を使わない）
+fn connection_to_yaml(conn: &ConnectionConfig) -> String {
+    match conn {
+        ConnectionConfig::Direct(c) => {
+            let mut lines = vec![
+                format!("\n- type: direct"),
+                format!("  name: {}", c.name),
+            ];
+            if let Some(ref label) = c.label {
+                lines.push(format!("  label: {}", label));
+            }
+            if c.readonly {
+                lines.push("  readonly: true".to_string());
+            }
+            lines.push(format!("  host: {}", c.host));
+            lines.push(format!("  port: {}", c.port));
+            lines.push(format!("  database: {}", c.database));
+            lines.push(format!("  user: {}", c.user));
+            if let Some(ref pw) = c.password {
+                lines.push(format!("  password: \"{}\"", pw));
+            }
+            lines.push(String::new());
+            lines.join("\n")
+        }
+        ConnectionConfig::Ssh(c) => {
+            let mut lines = vec![
+                format!("\n- type: ssh"),
+                format!("  name: {}", c.name),
+            ];
+            if let Some(ref label) = c.label {
+                lines.push(format!("  label: {}", label));
+            }
+            if c.readonly {
+                lines.push("  readonly: true".to_string());
+            }
+            lines.push(format!("  ssh_host: {}", c.ssh_host));
+            if let Some(ref user) = c.ssh_user {
+                lines.push(format!("  ssh_user: {}", user));
+            }
+            lines.push(format!("  remote_db_host: {}", c.remote_db_host));
+            lines.push(format!("  remote_db_port: {}", c.remote_db_port));
+            lines.push(format!("  local_port: {}", c.local_port));
+            lines.push(format!("  database: {}", c.database));
+            lines.push(format!("  user: {}", c.user));
+            if let Some(ref pw) = c.password {
+                lines.push(format!("  password: \"{}\"", pw));
+            }
+            lines.push(String::new());
+            lines.join("\n")
+        }
+        ConnectionConfig::Ssm(c) => {
+            let mut lines = vec![
+                format!("\n- type: ssm"),
+                format!("  name: {}", c.name),
+            ];
+            if let Some(ref label) = c.label {
+                lines.push(format!("  label: {}", label));
+            }
+            if c.readonly {
+                lines.push("  readonly: true".to_string());
+            }
+            lines.push(format!("  instance_id: {}", c.instance_id));
+            lines.push(format!("  ssh_user: {}", c.ssh_user));
+            if let Some(ref key) = c.ssh_key {
+                lines.push(format!("  ssh_key: {}", key));
+            }
+            if let Some(ref profile) = c.aws_profile {
+                lines.push(format!("  aws_profile: {}", profile));
+            }
+            lines.push(format!("  remote_db_host: {}", c.remote_db_host));
+            lines.push(format!("  remote_db_port: {}", c.remote_db_port));
+            lines.push(format!("  local_port: {}", c.local_port));
+            lines.push(format!("  database: {}", c.database));
+            lines.push(format!("  user: {}", c.user));
+            if let Some(ref pw) = c.password {
+                lines.push(format!("  password: \"{}\"", pw));
+            }
+            lines.push(String::new());
+            lines.join("\n")
+        }
+    }
 }
 
 /// ファイルのパーミッションを 600 (owner のみ読み書き) に設定する

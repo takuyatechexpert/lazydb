@@ -25,6 +25,7 @@ csv          = "1"
 rpassword    = "7"
 chrono       = { version = "0.4", features = ["serde"] }
 dirs         = "5"
+keyring      = "3"
 
 [profile.dev]
 opt-level = 1

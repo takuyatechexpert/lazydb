@@ -62,7 +62,7 @@ impl NewConnectionForm {
                 ("port", "5432".to_string()),
                 ("database", String::new()),
                 ("user", "postgres".to_string()),
-                ("password", String::new()),
+                ("password (keychain)", String::new()),
             ],
             cursor: 0,
         }
@@ -726,11 +726,18 @@ impl App {
                 }
 
                 let port: u16 = self.new_conn_form.get("port").parse().unwrap_or(5432);
-                let password_raw = self.new_conn_form.get("password").to_string();
-                let password = if password_raw.is_empty() {
+                let password_raw = self.new_conn_form.get("password (keychain)").to_string();
+
+                // パスワードが入力されていたら Keychain に保存
+                let password_field = if password_raw.is_empty() {
                     None
                 } else {
-                    Some(password_raw)
+                    use crate::config::connections::set_keychain_password;
+                    if let Err(e) = set_keychain_password(&name, &password_raw) {
+                        self.status_message = Some(format!("キーチェーン保存エラー: {}", e));
+                        return std::ops::ControlFlow::Continue(());
+                    }
+                    Some(format!("keychain:{}", name))
                 };
 
                 use crate::config::connections::{DirectConfig, save_connection};
@@ -743,7 +750,7 @@ impl App {
                     port,
                     database,
                     user,
-                    password,
+                    password: password_field,
                 });
 
                 // connections.yml に保存

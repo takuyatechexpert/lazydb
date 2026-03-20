@@ -66,6 +66,18 @@ enum Commands {
         #[arg(long)]
         limit: Option<u64>,
     },
+
+    /// パスワードを OS キーチェーンに保存
+    SetPassword {
+        /// 接続名
+        connection: String,
+    },
+
+    /// パスワードを OS キーチェーンから削除
+    DeletePassword {
+        /// 接続名
+        connection: String,
+    },
 }
 
 #[tokio::main]
@@ -89,6 +101,12 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+        Some(Commands::SetPassword { connection }) => {
+            cmd_set_password(&connection)?;
+        }
+        Some(Commands::DeletePassword { connection }) => {
+            cmd_delete_password(&connection)?;
+        }
         None => {
             let app_config = load_config(cli.config.as_deref())?;
             let connections = load_connections(cli.connections.as_deref())?;
@@ -96,6 +114,21 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn cmd_set_password(connection: &str) -> Result<()> {
+    let password = rpassword::prompt_password(format!("Password for '{}': ", connection))
+        .context("パスワードの入力に失敗しました")?;
+    config::connections::set_keychain_password(connection, &password)?;
+    println!("キーチェーンに保存しました: {}", connection);
+    println!("connections.yml で password: \"keychain:{}\" を設定してください", connection);
+    Ok(())
+}
+
+fn cmd_delete_password(connection: &str) -> Result<()> {
+    config::connections::delete_keychain_password(connection)?;
+    println!("キーチェーンから削除しました: {}", connection);
     Ok(())
 }
 
