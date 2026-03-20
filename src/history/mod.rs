@@ -59,6 +59,8 @@ impl HistoryStore {
         std::fs::write(&self.path, content + "\n")
             .with_context(|| format!("履歴ファイルに書き込めません: {:?}", self.path))?;
 
+        ensure_secure_permissions(&self.path);
+
         Ok(())
     }
 
@@ -92,6 +94,20 @@ impl HistoryStore {
         Ok(filtered)
     }
 }
+
+#[cfg(unix)]
+fn ensure_secure_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_secure_permissions(_path: &std::path::Path) {}
 
 fn dirs_or_default() -> PathBuf {
     dirs::data_local_dir()

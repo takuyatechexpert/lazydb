@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -80,6 +80,9 @@ pub fn load_connections(config_path: Option<&str>) -> Result<Vec<ConnectionConfi
         return Ok(Vec::new());
     }
 
+    // パーミッションが緩い場合は自動修正
+    ensure_secure_permissions(&path);
+
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("接続設定ファイルが見つかりません: {}", path.display()))?;
 
@@ -114,7 +117,26 @@ pub fn save_connection(conn: &ConnectionConfig) -> Result<()> {
     std::fs::write(&path, yaml)
         .with_context(|| format!("接続設定ファイルに書き込めません: {}", path.display()))?;
 
+    ensure_secure_permissions(&path);
+
     Ok(())
+}
+
+/// ファイルのパーミッションを 600 (owner のみ読み書き) に設定する
+#[cfg(unix)]
+fn ensure_secure_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_secure_permissions(_path: &Path) {
+    // Windows では別途対応が必要
 }
 
 pub fn expand_tilde(path: &str) -> PathBuf {
