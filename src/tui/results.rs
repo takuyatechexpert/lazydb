@@ -8,7 +8,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use super::{App, Panel};
+// App / Panel は不要: render は ResultsState を直接受け取る
 
 // ── 状態 ──
 
@@ -49,6 +49,10 @@ impl ResultsState {
             result: None,
             visible_width: 0,
         }
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::new();
     }
 
     pub fn set_result(&mut self, result: QueryResult, auto_limited: bool) {
@@ -156,8 +160,7 @@ impl ResultsState {
 
 // ── 描画 ──
 
-pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let is_focused = app.active_panel == Panel::Results;
+pub fn render(f: &mut Frame, results: &ResultsState, is_focused: bool, area: Rect) {
     let border_style = if is_focused {
         Style::default().fg(Color::Cyan)
     } else {
@@ -176,7 +179,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    match &app.results.status {
+    match &results.status {
         ResultStatus::Empty => {
             let p = Paragraph::new("  クエリを実行すると結果が表示されます");
             f.render_widget(p, inner);
@@ -195,13 +198,12 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             f.render_widget(p, inner);
         }
         ResultStatus::Success => {
-            render_table(f, app, inner);
+            render_table(f, results, is_focused, inner);
         }
     }
 }
 
-fn render_table(f: &mut Frame, app: &App, area: Rect) {
-    let results = &app.results;
+fn render_table(f: &mut Frame, results: &ResultsState, is_focused: bool, area: Rect) {
     if results.columns.is_empty() {
         let p = Paragraph::new("  (0 rows)");
         f.render_widget(p, area);
@@ -245,7 +247,7 @@ fn render_table(f: &mut Frame, app: &App, area: Rect) {
             .enumerate()
             .map(|(j, cell)| pad_right(cell, results.col_widths.get(j).copied().unwrap_or(0)))
             .collect();
-        let style = if i == results.scroll_offset && app.active_panel == Panel::Results {
+        let style = if i == results.scroll_offset && is_focused {
             Style::default().fg(Color::Cyan)
         } else {
             Style::default()

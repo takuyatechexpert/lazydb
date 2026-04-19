@@ -8,10 +8,12 @@ mod tui;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::{config::load_config, connections::load_connections};
+use config::connections::DbType;
 use db::{
-    adapter::{DbAdapter, QueryResult},
+    adapter::QueryResult,
+    mysql::MysqlAdapter,
     postgres::PostgresAdapter,
-    LimitApplier, ReadonlyChecker,
+    AnyAdapter, LimitApplier, ReadonlyChecker,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -134,8 +136,8 @@ fn cmd_delete_password(connection: &str) -> Result<()> {
 
 async fn cmd_list_connections(connections_path: Option<&str>) -> Result<()> {
     let connections = load_connections(connections_path)?;
-    println!("{:<20} {:<8} {:<10}", "NAME", "LABEL", "TYPE");
-    println!("{}", "-".repeat(42));
+    println!("{:<20} {:<8} {:<10} {:<12}", "NAME", "LABEL", "TYPE", "DB");
+    println!("{}", "-".repeat(54));
     for conn in &connections {
         let label = conn.label().unwrap_or("-");
         let type_str = match conn {
@@ -143,7 +145,7 @@ async fn cmd_list_connections(connections_path: Option<&str>) -> Result<()> {
             config::connections::ConnectionConfig::Ssh(_) => "ssh",
             config::connections::ConnectionConfig::Ssm(_) => "ssm",
         };
-        println!("{:<20} {:<8} {:<10}", conn.name(), label, type_str);
+        println!("{:<20} {:<8} {:<10} {:<12}", conn.name(), label, type_str, conn.db_type());
     }
     Ok(())
 }
@@ -197,15 +199,9 @@ async fn cmd_exec(
     let mut _tunnel: Option<Box<dyn std::any::Any>> = None;
     let password = conn_config.resolve_password()?;
 
-    let mut adapter = match conn_config {
+    let (host, port, database, user, db_type) = match conn_config {
         config::connections::ConnectionConfig::Direct(c) => {
-            PostgresAdapter::new(
-                c.host.clone(),
-                c.port,
-                c.database.clone(),
-                c.user.clone(),
-                password,
-            )
+            (c.host.clone(), c.port, c.database.clone(), c.user.clone(), &c.db_type)
         }
         config::connections::ConnectionConfig::Ssh(c) => {
             use tunnel::ssh::SshTunnel;
@@ -218,13 +214,7 @@ async fn cmd_exec(
             )
             .await?;
             _tunnel = Some(Box::new(tunnel));
-            PostgresAdapter::new(
-                "127.0.0.1".to_string(),
-                c.local_port,
-                c.database.clone(),
-                c.user.clone(),
-                password,
-            )
+            ("127.0.0.1".to_string(), c.local_port, c.database.clone(), c.user.clone(), &c.db_type)
         }
         config::connections::ConnectionConfig::Ssm(c) => {
             use tunnel::ssm::SsmTunnel;
@@ -239,14 +229,13 @@ async fn cmd_exec(
             )
             .await?;
             _tunnel = Some(Box::new(tunnel));
-            PostgresAdapter::new(
-                "127.0.0.1".to_string(),
-                c.local_port,
-                c.database.clone(),
-                c.user.clone(),
-                password,
-            )
+            ("127.0.0.1".to_string(), c.local_port, c.database.clone(), c.user.clone(), &c.db_type)
         }
+    };
+
+    let mut adapter = match db_type {
+        DbType::Postgresql => AnyAdapter::Postgres(PostgresAdapter::new(host, port, database, user, password)),
+        DbType::Mysql => AnyAdapter::Mysql(MysqlAdapter::new(host, port, database, user, password)),
     };
 
     // 接続確認

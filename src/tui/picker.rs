@@ -37,6 +37,8 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 ConnectionConfig::Ssm(_) => "ssm",
             };
 
+            let db_str = conn.db_type().to_string();
+
             let line = Line::from(vec![
                 Span::raw(prefix),
                 Span::styled(
@@ -53,6 +55,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 ),
                 Span::styled(
                     format!("  {}", type_str),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!("  {}", db_str),
                     Style::default().fg(Color::DarkGray),
                 ),
             ]);
@@ -298,11 +304,15 @@ pub fn render_export_path(f: &mut Frame, app: &App, area: Rect) {
 }
 
 pub fn render_new_connection(f: &mut Frame, app: &App, area: Rect) {
-    let popup = centered_rect(50, 50, area);
+    let popup = centered_rect(55, 75, area);
     f.render_widget(Clear, popup);
 
+    let title = format!(" New Connection ({} / {}) ",
+        app.new_conn_form.conn_type.label(),
+        app.new_conn_form.db_type.label(),
+    );
     let block = Block::default()
-        .title(" New Connection (Direct) ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Green));
 
@@ -312,8 +322,55 @@ pub fn render_new_connection(f: &mut Frame, app: &App, area: Rect) {
     let form = &app.new_conn_form;
     let mut lines: Vec<Line> = Vec::new();
 
+    // Row 0: conn_type selector
+    {
+        let is_active = form.cursor == 0;
+        let label_style = if is_active {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let value_style = if is_active {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let hint = if is_active { "  ← → で切替" } else { "" };
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:<18}", "type"), label_style),
+            Span::styled(format!("◀ {} ▶", form.conn_type.label()), value_style),
+            Span::styled(hint, Style::default().fg(Color::DarkGray)),
+        ]));
+        lines.push(Line::raw(""));
+    }
+
+    // Row 1: db_type selector
+    {
+        let is_active = form.cursor == 1;
+        let label_style = if is_active {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let value_style = if is_active {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let hint = if is_active { "  ← → で切替" } else { "" };
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:<18}", "db_type"), label_style),
+            Span::styled(format!("◀ {} ▶", form.db_type.label()), value_style),
+            Span::styled(hint, Style::default().fg(Color::DarkGray)),
+        ]));
+        lines.push(Line::raw(""));
+    }
+
+    // Row 2+: dynamic fields
     for (i, (label, value)) in form.fields.iter().enumerate() {
-        let is_active = i == form.cursor;
+        let is_active = form.cursor == i + 2;
         let label_style = if is_active {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
         } else {
@@ -321,9 +378,16 @@ pub fn render_new_connection(f: &mut Frame, app: &App, area: Rect) {
         };
         let cursor_indicator = if is_active { "█" } else { "" };
 
+        // password フィールドはマスク表示
+        let display_value: String = if *label == "password" && !value.is_empty() {
+            "*".repeat(value.len())
+        } else {
+            value.clone()
+        };
+
         lines.push(Line::from(vec![
-            Span::styled(format!("  {:<12}", label), label_style),
-            Span::styled(value.as_str(), Style::default().fg(Color::White)),
+            Span::styled(format!("  {:<18}", label), label_style),
+            Span::styled(display_value, Style::default().fg(Color::White)),
             Span::styled(cursor_indicator, Style::default().fg(Color::Gray)),
         ]));
         lines.push(Line::raw(""));
@@ -341,7 +405,9 @@ pub fn render_new_connection(f: &mut Frame, app: &App, area: Rect) {
     if hint_area.y < area.height {
         let hint = Paragraph::new(Line::from(vec![
             Span::styled(" Tab/↑↓ ", Style::default().fg(Color::Cyan)),
-            Span::raw("フィールド移動  "),
+            Span::raw("移動  "),
+            Span::styled("← → ", Style::default().fg(Color::Cyan)),
+            Span::raw("type切替  "),
             Span::styled("Enter ", Style::default().fg(Color::Cyan)),
             Span::raw("作成  "),
             Span::styled("Esc ", Style::default().fg(Color::Cyan)),

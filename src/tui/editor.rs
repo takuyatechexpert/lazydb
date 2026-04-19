@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use super::{App, Panel};
+// App / Panel は不要: render は EditorState を直接受け取る
 
 // ── SQL キーワード ──
 
@@ -726,15 +726,14 @@ fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
 
 // ── 描画 ──
 
-pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let is_focused = app.active_panel == Panel::Editor;
+pub fn render(f: &mut Frame, editor: &EditorState, is_focused: bool, area: Rect) {
     let border_style = if is_focused {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)
     };
 
-    let title = if app.editor.executing {
+    let title = if editor.executing {
         " Query Editor [実行中...] "
     } else {
         " Query Editor "
@@ -752,19 +751,19 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let line_num_width = format!("{}", app.editor.lines.len()).len().max(2);
+    let line_num_width = format!("{}", editor.lines.len()).len().max(2);
     let _editor_width = inner.width as usize - line_num_width - 2; // 2 for "│ "
 
     let visible_height = inner.height as usize;
 
     // 表示する行
-    let start = app.editor.scroll_offset;
-    let end = (start + visible_height).min(app.editor.lines.len());
+    let start = editor.scroll_offset;
+    let end = (start + visible_height).min(editor.lines.len());
 
     let mut display_lines: Vec<Line> = Vec::new();
 
     for i in start..end {
-        let line = &app.editor.lines[i];
+        let line = &editor.lines[i];
         let line_num = format!("{:>width$}", i + 1, width = line_num_width);
 
         let mut spans = vec![
@@ -776,7 +775,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         spans.extend(highlight_sql(line));
 
         // カーソル表示（フォーカス時のみ）
-        if is_focused && i == app.editor.cursor.0 {
+        if is_focused && i == editor.cursor.0 {
             // カーソル位置のハイライトは ratatui では直接できないので
             // set_cursor で対応
         }
@@ -797,23 +796,22 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let paragraph = Paragraph::new(display_lines);
     f.render_widget(paragraph, inner);
 
-    // カーソル表示
-    if is_focused && app.mode == super::AppMode::Normal {
-        let cursor_x = inner.x + line_num_width as u16 + 1 + app.editor.cursor.1 as u16;
-        let cursor_y = inner.y + (app.editor.cursor.0 - app.editor.scroll_offset) as u16;
+    // カーソル表示（Normal / Insert 両モード）
+    if is_focused {
+        let cursor_x = inner.x + line_num_width as u16 + 1 + editor.cursor.1 as u16;
+        let cursor_y = inner.y + (editor.cursor.0 - editor.scroll_offset) as u16;
         if cursor_x < inner.x + inner.width && cursor_y < inner.y + inner.height {
             f.set_cursor_position((cursor_x, cursor_y));
         }
     }
 
     // オートコンプリート プルダウン
-    if is_focused && app.editor.completion.active && !app.editor.completion.candidates.is_empty() {
-        let cursor_x = inner.x + line_num_width as u16 + 1 + app.editor.cursor.1 as u16;
-        let cursor_y = inner.y + (app.editor.cursor.0 - app.editor.scroll_offset) as u16;
+    if is_focused && editor.completion.active && !editor.completion.candidates.is_empty() {
+        let cursor_x = inner.x + line_num_width as u16 + 1 + editor.cursor.1 as u16;
+        let cursor_y = inner.y + (editor.cursor.0 - editor.scroll_offset) as u16;
 
-        let max_items = app.editor.completion.candidates.len().min(8);
-        let popup_width = app
-            .editor
+        let max_items = editor.completion.candidates.len().min(8);
+        let popup_width = editor
             .completion
             .candidates
             .iter()
@@ -824,7 +822,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             + 4;
 
         // prefix 分だけ左にオフセット
-        let prefix_len = app.editor.completion.prefix.len() as u16;
+        let prefix_len = editor.completion.prefix.len() as u16;
         let popup_x = cursor_x.saturating_sub(prefix_len);
         let popup_y = cursor_y + 1;
         let popup_height = max_items as u16 + 2; // ボーダー分
@@ -837,15 +835,14 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
             f.render_widget(Clear, popup_area);
 
-            let items: Vec<ListItem> = app
-                .editor
+            let items: Vec<ListItem> = editor
                 .completion
                 .candidates
                 .iter()
                 .enumerate()
                 .take(max_items)
                 .map(|(i, candidate)| {
-                    let style = if i == app.editor.completion.cursor {
+                    let style = if i == editor.completion.cursor {
                         Style::default().bg(Color::Cyan).fg(Color::Black)
                     } else {
                         Style::default().fg(Color::White)

@@ -1,6 +1,58 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DbType {
+    #[default]
+    Postgresql,
+    Mysql,
+}
+
+impl fmt::Display for DbType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DbType::Postgresql => write!(f, "postgresql"),
+            DbType::Mysql => write!(f, "mysql"),
+        }
+    }
+}
+
+impl DbType {
+    pub fn default_port(&self) -> u16 {
+        match self {
+            DbType::Postgresql => 5432,
+            DbType::Mysql => 3306,
+        }
+    }
+
+    /// 識別子をクォートする（PostgreSQL: "...", MySQL: `...`）
+    pub fn quote_identifier(&self, name: &str) -> String {
+        match self {
+            DbType::Postgresql => {
+                let needs_quote = name.is_empty()
+                    || name.chars().next().is_none_or(|c| !c.is_ascii_lowercase() && c != '_')
+                    || !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+                if needs_quote {
+                    format!("\"{}\"", name.replace('"', "\"\""))
+                } else {
+                    name.to_string()
+                }
+            }
+            DbType::Mysql => {
+                let needs_quote = name.is_empty()
+                    || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                if needs_quote {
+                    format!("`{}`", name.replace('`', "``"))
+                } else {
+                    name.to_string()
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -35,6 +87,14 @@ impl ConnectionConfig {
         }
     }
 
+    pub fn db_type(&self) -> &DbType {
+        match self {
+            ConnectionConfig::Direct(c) => &c.db_type,
+            ConnectionConfig::Ssh(c) => &c.db_type,
+            ConnectionConfig::Ssm(c) => &c.db_type,
+        }
+    }
+
     /// パスワードを解決して返す
     pub fn resolve_password(&self) -> Result<Option<String>> {
         let raw = match self {
@@ -47,7 +107,7 @@ impl ConnectionConfig {
 }
 
 /// パスワード値を解決する
-///   None             → .pgpass に委譲
+///   None             → パスワードなしで接続（trust / peer 認証向け）
 ///   "prompt"         → 対話入力（マスク表示）
 ///   "env:VAR"        → 環境変数から取得
 ///   "keychain:NAME"  → OS キーチェーンから取得（macOS Keychain / Linux Secret Service）
@@ -188,6 +248,9 @@ fn connection_to_yaml(conn: &ConnectionConfig) -> String {
             if c.readonly {
                 lines.push("  readonly: true".to_string());
             }
+            if c.db_type != DbType::Postgresql {
+                lines.push(format!("  db_type: {}", c.db_type));
+            }
             lines.push(format!("  host: {}", c.host));
             lines.push(format!("  port: {}", c.port));
             lines.push(format!("  database: {}", c.database));
@@ -208,6 +271,9 @@ fn connection_to_yaml(conn: &ConnectionConfig) -> String {
             }
             if c.readonly {
                 lines.push("  readonly: true".to_string());
+            }
+            if c.db_type != DbType::Postgresql {
+                lines.push(format!("  db_type: {}", c.db_type));
             }
             lines.push(format!("  ssh_host: {}", c.ssh_host));
             if let Some(ref user) = c.ssh_user {
@@ -234,6 +300,9 @@ fn connection_to_yaml(conn: &ConnectionConfig) -> String {
             }
             if c.readonly {
                 lines.push("  readonly: true".to_string());
+            }
+            if c.db_type != DbType::Postgresql {
+                lines.push(format!("  db_type: {}", c.db_type));
             }
             lines.push(format!("  instance_id: {}", c.instance_id));
             lines.push(format!("  ssh_user: {}", c.ssh_user));
@@ -289,6 +358,8 @@ pub struct DirectConfig {
     pub label: Option<String>,
     #[serde(default)]
     pub readonly: bool,
+    #[serde(default)]
+    pub db_type: DbType,
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
@@ -303,6 +374,8 @@ pub struct SshConfig {
     pub label: Option<String>,
     #[serde(default)]
     pub readonly: bool,
+    #[serde(default)]
+    pub db_type: DbType,
     /// SSH ホストまたは ~/.ssh/config の Host エイリアス
     pub ssh_host: String,
     /// SSH ユーザー（省略時は ~/.ssh/config の User を使用）
@@ -322,6 +395,8 @@ pub struct SsmConfig {
     pub label: Option<String>,
     #[serde(default)]
     pub readonly: bool,
+    #[serde(default)]
+    pub db_type: DbType,
     pub instance_id: String,
     pub ssh_user: String,
     pub ssh_key: Option<String>,
@@ -337,4 +412,114 @@ pub struct SsmConfig {
 
 fn default_port() -> u16 {
     5432
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── DbType ──
+
+    #[test]
+    fn db_type_default_is_postgresql() {
+        assert_eq!(DbType::default(), DbType::Postgresql);
+    }
+
+    #[test]
+    fn db_type_default_ports() {
+        assert_eq!(DbType::Postgresql.default_port(), 5432);
+        assert_eq!(DbType::Mysql.default_port(), 3306);
+    }
+
+    #[test]
+    fn db_type_display() {
+        assert_eq!(format!("{}", DbType::Postgresql), "postgresql");
+        assert_eq!(format!("{}", DbType::Mysql), "mysql");
+    }
+
+    // ── quote_identifier PostgreSQL ──
+
+    #[test]
+    fn pg_quote_lowercase_no_quote() {
+        assert_eq!(DbType::Postgresql.quote_identifier("users"), "users");
+    }
+
+    #[test]
+    fn pg_quote_uppercase_needs_quote() {
+        assert_eq!(DbType::Postgresql.quote_identifier("Users"), "\"Users\"");
+    }
+
+    #[test]
+    fn pg_quote_special_chars() {
+        assert_eq!(DbType::Postgresql.quote_identifier("my-table"), "\"my-table\"");
+    }
+
+    #[test]
+    fn pg_quote_escapes_double_quotes() {
+        assert_eq!(DbType::Postgresql.quote_identifier("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn pg_quote_empty() {
+        assert_eq!(DbType::Postgresql.quote_identifier(""), "\"\"");
+    }
+
+    // ── quote_identifier MySQL ──
+
+    #[test]
+    fn mysql_quote_simple_no_quote() {
+        assert_eq!(DbType::Mysql.quote_identifier("users"), "users");
+    }
+
+    #[test]
+    fn mysql_quote_uppercase_no_quote() {
+        // MySQL はケース非依存なのでクォート不要
+        assert_eq!(DbType::Mysql.quote_identifier("Users"), "Users");
+    }
+
+    #[test]
+    fn mysql_quote_special_chars() {
+        assert_eq!(DbType::Mysql.quote_identifier("my-table"), "`my-table`");
+    }
+
+    #[test]
+    fn mysql_quote_escapes_backticks() {
+        assert_eq!(DbType::Mysql.quote_identifier("a`b"), "`a``b`");
+    }
+
+    #[test]
+    fn mysql_quote_empty() {
+        assert_eq!(DbType::Mysql.quote_identifier(""), "``");
+    }
+
+    // ── YAML デシリアライズ後方互換性 ──
+
+    #[test]
+    fn deserialize_without_db_type_defaults_to_postgresql() {
+        let yaml = r#"
+- type: direct
+  name: test
+  host: localhost
+  port: 5432
+  database: testdb
+  user: postgres
+"#;
+        let conns: Vec<ConnectionConfig> = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(conns[0].db_type(), &DbType::Postgresql);
+    }
+
+    #[test]
+    fn deserialize_with_db_type_mysql() {
+        let yaml = r#"
+- type: direct
+  name: test
+  db_type: mysql
+  host: localhost
+  port: 3306
+  database: testdb
+  user: root
+"#;
+        let conns: Vec<ConnectionConfig> = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(conns[0].db_type(), &DbType::Mysql);
+    }
 }

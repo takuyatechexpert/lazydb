@@ -1,5 +1,5 @@
-# Direct 接続
-- name: local
+# Direct 接続 (PostgreSQL)
+- name: local-pg
   label: local
   type: direct
   host: 127.0.0.1
@@ -7,6 +7,18 @@
   database: myapp_dev
   user: postgres
   password: "env:PGPASSWORD"        # env:VAR / prompt / 平文
+  # db_type: postgresql             # デフォルト: postgresql（省略可）
+
+# Direct 接続 (MySQL)
+- name: local-mysql
+  label: local
+  type: direct
+  db_type: mysql
+  host: 127.0.0.1
+  port: 3306
+  database: myapp_dev
+  user: root
+  password: "env:MYSQL_PWD"
 
 # SSH トンネル
 - name: staging

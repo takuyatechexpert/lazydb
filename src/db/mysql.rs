@@ -1,15 +1,15 @@
 use crate::db::adapter::{ColumnInfo, DbAdapter, QueryResult, TableInfo};
 use anyhow::{Context, Result};
-use sqlx::postgres::PgPoolOptions;
-use sqlx::{Column, PgPool, Row};
+use sqlx::mysql::MySqlPoolOptions;
+use sqlx::{Column, MySqlPool, Row};
 use std::time::Instant;
 
-pub struct PostgresAdapter {
-    pool: Option<PgPool>,
+pub struct MysqlAdapter {
+    pool: Option<MySqlPool>,
     connection_url: String,
 }
 
-impl PostgresAdapter {
+impl MysqlAdapter {
     pub fn new(
         host: String,
         port: u16,
@@ -20,7 +20,7 @@ impl PostgresAdapter {
         let pw = password.as_deref().unwrap_or("");
         let encoded_pw = urlencoding::encode(pw);
         let connection_url = format!(
-            "postgres://{}:{}@{}:{}/{}?sslmode=prefer",
+            "mysql://{}:{}@{}:{}/{}",
             user, encoded_pw, host, port, database
         );
         Self {
@@ -30,19 +30,19 @@ impl PostgresAdapter {
     }
 }
 
-impl DbAdapter for PostgresAdapter {
+impl DbAdapter for MysqlAdapter {
     async fn connect(&mut self) -> Result<()> {
-        let pool = PgPoolOptions::new()
+        let pool = MySqlPoolOptions::new()
             .max_connections(2)
             .connect(&self.connection_url)
             .await
-            .context("PostgreSQL への接続に失敗しました")?;
+            .context("MySQL への接続に失敗しました")?;
 
         // 疎通確認
         sqlx::query("SELECT 1")
             .execute(&pool)
             .await
-            .context("PostgreSQL 疎通確認に失敗しました")?;
+            .context("MySQL 疎通確認に失敗しました")?;
 
         self.pool = Some(pool);
         Ok(())
@@ -64,8 +64,6 @@ impl DbAdapter for PostgresAdapter {
         let duration_ms = start.elapsed().as_millis() as u64;
 
         if rows.is_empty() {
-            // DML の場合や結果が空の場合
-            // カラム情報が取れるか試す
             return Ok(QueryResult {
                 columns: vec![],
                 rows: vec![],
@@ -87,7 +85,7 @@ impl DbAdapter for PostgresAdapter {
                 columns
                     .iter()
                     .enumerate()
-                    .map(|(i, _)| get_pg_value_as_string(row, i))
+                    .map(|(i, _)| get_mysql_value_as_string(row, i))
                     .collect()
             })
             .collect();
@@ -107,7 +105,7 @@ impl DbAdapter for PostgresAdapter {
 
         let rows = sqlx::query(
             "SELECT table_name FROM information_schema.tables \
-             WHERE table_schema = 'public' ORDER BY table_name",
+             WHERE table_schema = DATABASE() ORDER BY table_name",
         )
         .fetch_all(pool)
         .await
@@ -128,8 +126,8 @@ impl DbAdapter for PostgresAdapter {
             .context("データベースに接続されていません")?;
 
         let rows = sqlx::query(
-            "SELECT column_name, data_type FROM information_schema.columns \
-             WHERE table_schema = 'public' AND table_name = $1 ORDER BY ordinal_position",
+            "SELECT column_name, column_type FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = ? ORDER BY ordinal_position",
         )
         .bind(table)
         .fetch_all(pool)
@@ -140,14 +138,14 @@ impl DbAdapter for PostgresAdapter {
             .iter()
             .map(|r| ColumnInfo {
                 name: r.get::<String, _>("column_name"),
-                col_type: r.get::<String, _>("data_type"),
+                col_type: r.get::<String, _>("column_type"),
             })
             .collect())
     }
 }
 
-/// PgRow から文字列として値を取得する
-fn get_pg_value_as_string(row: &sqlx::postgres::PgRow, index: usize) -> String {
+/// MySqlRow から文字列として値を取得する
+fn get_mysql_value_as_string(row: &sqlx::mysql::MySqlRow, index: usize) -> String {
     use sqlx::TypeInfo;
     use sqlx::ValueRef;
 
@@ -160,27 +158,23 @@ fn get_pg_value_as_string(row: &sqlx::postgres::PgRow, index: usize) -> String {
     let type_name = type_info.name();
 
     match type_name {
-        "BOOL" => row
+        "BOOLEAN" | "TINYINT(1)" => row
             .try_get::<bool, _>(index)
             .map(|v| v.to_string())
             .unwrap_or_default(),
-        "INT2" => row
-            .try_get::<i16, _>(index)
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
-        "INT4" => row
+        "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" => row
             .try_get::<i32, _>(index)
             .map(|v| v.to_string())
             .unwrap_or_default(),
-        "INT8" => row
+        "BIGINT" => row
             .try_get::<i64, _>(index)
             .map(|v| v.to_string())
             .unwrap_or_default(),
-        "FLOAT4" => row
+        "FLOAT" => row
             .try_get::<f32, _>(index)
             .map(|v| v.to_string())
             .unwrap_or_default(),
-        "FLOAT8" | "NUMERIC" => row
+        "DOUBLE" | "DECIMAL" => row
             .try_get::<f64, _>(index)
             .map(|v| v.to_string())
             .unwrap_or_default(),

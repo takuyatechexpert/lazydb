@@ -5,6 +5,7 @@
 ## 特徴
 
 - **TUI**: 3ペインレイアウト（Schema Browser / Query Editor / Results）
+- **マルチ DB**: PostgreSQL / MySQL 対応
 - **vim キーバインド**: Editor は Normal/Insert モーダル編集
 - **接続方式**: Direct / SSH トンネル / AWS SSM トンネル
 - **オートコンプリート**: SQL キーワード・テーブル名・カラム名のサジェスト
@@ -57,14 +58,26 @@ lazydb delete-password local
 ### `~/.config/lazydb/connections.yml`
 
 ```yaml
+# PostgreSQL（db_type 省略時のデフォルト）
 - type: direct
-  name: local
+  name: local-pg
   label: local
   host: localhost
   port: 5432
   database: mydb
   user: postgres
-  password: "keychain:local"   # keychain:NAME / env:VAR / prompt / 平文
+  password: "keychain:local-pg"  # keychain:NAME / env:VAR / prompt / 平文
+
+# MySQL
+- type: direct
+  name: local-mysql
+  label: local
+  db_type: mysql
+  host: localhost
+  port: 3306
+  database: mydb
+  user: root
+  password: "env:MYSQL_PWD"
 
 - type: ssh
   name: staging-db
@@ -113,6 +126,15 @@ default_connection: local   # auto_connect 時の接続名
 | `Ctrl+Q` | 終了 |
 | `?` | ヘルプ |
 
+### タブ操作
+
+| キー | 動作 |
+|------|------|
+| `Ctrl+T` | 新規タブ追加 |
+| `Ctrl+W` | アクティブタブを閉じる |
+| `Ctrl+N` | 次のタブへ |
+| `Ctrl+P` | 前のタブへ |
+
 ### Editor Normal モード
 
 | キー | 動作 |
@@ -145,9 +167,10 @@ default_connection: local   # auto_connect 時の接続名
 ## 必要要件
 
 - Rust 1.70+
-- PostgreSQL (`psql` コマンド)
 - SSH トンネル使用時: `ssh` コマンド
 - SSM トンネル使用時: AWS CLI (`aws`)
+
+> **Note:** PostgreSQL / MySQL への接続はネイティブドライバ（sqlx）を使用するため、`psql` や `mysql` コマンドのインストールは不要です。
 
 ## ライセンス
 

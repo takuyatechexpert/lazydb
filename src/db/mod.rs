@@ -1,10 +1,48 @@
 pub mod adapter;
+pub mod mysql;
 pub mod postgres;
 
 #[cfg(test)]
 mod tests;
 
+use adapter::{ColumnInfo, DbAdapter, QueryResult, TableInfo};
 use anyhow::Result;
+
+/// PostgreSQL / MySQL を統一的に扱うアダプター enum
+pub enum AnyAdapter {
+    Postgres(postgres::PostgresAdapter),
+    Mysql(mysql::MysqlAdapter),
+}
+
+impl AnyAdapter {
+    pub async fn connect(&mut self) -> Result<()> {
+        match self {
+            AnyAdapter::Postgres(a) => adapter::DbAdapter::connect(a).await,
+            AnyAdapter::Mysql(a) => adapter::DbAdapter::connect(a).await,
+        }
+    }
+
+    pub async fn execute(&self, query: &str) -> Result<QueryResult> {
+        match self {
+            AnyAdapter::Postgres(a) => a.execute(query).await,
+            AnyAdapter::Mysql(a) => a.execute(query).await,
+        }
+    }
+
+    pub async fn fetch_tables(&self) -> Result<Vec<TableInfo>> {
+        match self {
+            AnyAdapter::Postgres(a) => a.fetch_tables().await,
+            AnyAdapter::Mysql(a) => a.fetch_tables().await,
+        }
+    }
+
+    pub async fn fetch_columns(&self, table: &str) -> Result<Vec<ColumnInfo>> {
+        match self {
+            AnyAdapter::Postgres(a) => a.fetch_columns(table).await,
+            AnyAdapter::Mysql(a) => a.fetch_columns(table).await,
+        }
+    }
+}
 
 const WRITE_KEYWORDS: &[&str] = &[
     "INSERT", "UPDATE", "DELETE", "TRUNCATE", "DROP", "CREATE", "ALTER", "RENAME", "REPLACE",
