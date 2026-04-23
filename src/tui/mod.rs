@@ -186,7 +186,7 @@ impl NewConnectionForm {
                     ("database", String::new()),
                     ("user", user),
                     ("password", String::new()),
-                    ("readonly", String::new()),
+                    ("readonly", "false".to_string()),
                 ]);
             }
             ConnFormType::Ssh => {
@@ -199,7 +199,7 @@ impl NewConnectionForm {
                     ("database", String::new()),
                     ("user", user),
                     ("password", String::new()),
-                    ("readonly", String::new()),
+                    ("readonly", "false".to_string()),
                 ]);
             }
             ConnFormType::Ssm => {
@@ -214,7 +214,7 @@ impl NewConnectionForm {
                     ("database", String::new()),
                     ("user", user),
                     ("password", String::new()),
-                    ("readonly", String::new()),
+                    ("readonly", "false".to_string()),
                 ]);
             }
         }
@@ -231,6 +231,32 @@ impl NewConnectionForm {
             self.fields.get_mut(idx).map(|(_, v)| v)
         } else {
             None
+        }
+    }
+
+    /// 現在のカーソル位置のフィールド名を取得（type/db_type 行の場合は None）
+    pub fn current_field_name(&self) -> Option<&'static str> {
+        if self.cursor >= 2 {
+            let idx = self.cursor - 2;
+            self.fields.get(idx).map(|(k, _)| *k)
+        } else {
+            None
+        }
+    }
+
+    /// 現在のカーソル位置が bool トグルフィールド（readonly）かどうか
+    pub fn is_current_bool_toggle(&self) -> bool {
+        matches!(self.current_field_name(), Some("readonly"))
+    }
+
+    /// bool トグルフィールドの値を反転する
+    pub fn toggle_current_bool(&mut self) {
+        if let Some(val) = self.current_field_mut() {
+            *val = if val == "true" {
+                "false".to_string()
+            } else {
+                "true".to_string()
+            };
         }
     }
 
@@ -970,18 +996,39 @@ impl App {
                 };
             }
             KeyCode::Char(ch) => {
-                match self.new_conn_form.cursor {
-                    0 => {} // conn_type 行: ← → で切り替えるので文字入力は無視
-                    1 => {} // db_type 行: 同上
+                // 特殊行（type / db_type / bool トグルフィールド）では h/l/Space で切替・トグル
+                let on_type_row = self.new_conn_form.cursor == 0;
+                let on_db_type_row = self.new_conn_form.cursor == 1;
+                let on_bool_row = self.new_conn_form.is_current_bool_toggle();
+
+                match ch {
+                    'h' if on_type_row => {
+                        self.new_conn_form.conn_type = self.new_conn_form.conn_type.cycle_prev();
+                        self.new_conn_form.rebuild_fields();
+                    }
+                    'l' if on_type_row => {
+                        self.new_conn_form.conn_type = self.new_conn_form.conn_type.cycle_next();
+                        self.new_conn_form.rebuild_fields();
+                    }
+                    'h' | 'l' if on_db_type_row => {
+                        self.new_conn_form.db_type = self.new_conn_form.db_type.toggle();
+                        self.new_conn_form.rebuild_fields();
+                        self.new_conn_form.cursor = 1;
+                    }
+                    'h' | 'l' | ' ' if on_bool_row => {
+                        self.new_conn_form.toggle_current_bool();
+                    }
                     _ => {
-                        if let Some(val) = self.new_conn_form.current_field_mut() {
+                        if on_type_row || on_db_type_row || on_bool_row {
+                            // 特殊行では通常の文字入力は無視
+                        } else if let Some(val) = self.new_conn_form.current_field_mut() {
                             val.push(ch);
                         }
                     }
                 }
             }
             KeyCode::Backspace => {
-                if self.new_conn_form.cursor >= 2 {
+                if self.new_conn_form.cursor >= 2 && !self.new_conn_form.is_current_bool_toggle() {
                     if let Some(val) = self.new_conn_form.current_field_mut() {
                         val.pop();
                     }
@@ -998,7 +1045,11 @@ impl App {
                         self.new_conn_form.rebuild_fields();
                         self.new_conn_form.cursor = 1; // db_type 行に留まる
                     }
-                    _ => {}
+                    _ => {
+                        if self.new_conn_form.is_current_bool_toggle() {
+                            self.new_conn_form.toggle_current_bool();
+                        }
+                    }
                 }
             }
             KeyCode::Right => {
@@ -1012,7 +1063,11 @@ impl App {
                         self.new_conn_form.rebuild_fields();
                         self.new_conn_form.cursor = 1;
                     }
-                    _ => {}
+                    _ => {
+                        if self.new_conn_form.is_current_bool_toggle() {
+                            self.new_conn_form.toggle_current_bool();
+                        }
+                    }
                 }
             }
             KeyCode::Enter => {

@@ -335,7 +335,7 @@ pub fn render_new_connection(f: &mut Frame, app: &App, area: Rect) {
         } else {
             Style::default().fg(Color::White)
         };
-        let hint = if is_active { "  ← → で切替" } else { "" };
+        let hint = if is_active { "  h/l または ← → で切替" } else { "" };
 
         lines.push(Line::from(vec![
             Span::styled(format!("  {:<18}", "type"), label_style),
@@ -358,7 +358,7 @@ pub fn render_new_connection(f: &mut Frame, app: &App, area: Rect) {
         } else {
             Style::default().fg(Color::White)
         };
-        let hint = if is_active { "  ← → で切替" } else { "" };
+        let hint = if is_active { "  h/l または ← → で切替" } else { "" };
 
         lines.push(Line::from(vec![
             Span::styled(format!("  {:<18}", "db_type"), label_style),
@@ -376,6 +376,25 @@ pub fn render_new_connection(f: &mut Frame, app: &App, area: Rect) {
         } else {
             Style::default().fg(Color::DarkGray)
         };
+
+        // readonly フィールドは bool トグル表示
+        if *label == "readonly" {
+            let value_style = if is_active {
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let display = if value == "true" { "true" } else { "false" };
+            let hint = if is_active { "  h/l/Space でトグル" } else { "" };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:<18}", label), label_style),
+                Span::styled(format!("◀ {} ▶", display), value_style),
+                Span::styled(hint, Style::default().fg(Color::DarkGray)),
+            ]));
+            lines.push(Line::raw(""));
+            continue;
+        }
+
         let cursor_indicator = if is_active { "█" } else { "" };
 
         // password フィールドはマスク表示
@@ -406,8 +425,8 @@ pub fn render_new_connection(f: &mut Frame, app: &App, area: Rect) {
         let hint = Paragraph::new(Line::from(vec![
             Span::styled(" Tab/↑↓ ", Style::default().fg(Color::Cyan)),
             Span::raw("移動  "),
-            Span::styled("← → ", Style::default().fg(Color::Cyan)),
-            Span::raw("type切替  "),
+            Span::styled("h/l ← → ", Style::default().fg(Color::Cyan)),
+            Span::raw("切替/トグル  "),
             Span::styled("Enter ", Style::default().fg(Color::Cyan)),
             Span::raw("作成  "),
             Span::styled("Esc ", Style::default().fg(Color::Cyan)),
