@@ -284,6 +284,11 @@ fn next_clause_start(upper: &str) -> usize {
     end
 }
 
+/// 識別子を囲う引用符（バッククォート・ダブルクォート・シングルクォート）を剥がす
+fn strip_quotes(s: &str) -> &str {
+    s.trim_matches('`').trim_matches('"').trim_matches('\'')
+}
+
 fn extract_table(outer: &str, outer_upper: &str) -> Option<String> {
     let from_idx = find_keyword(outer_upper, "FROM")?;
     let after = &outer[from_idx + 4..];
@@ -298,27 +303,17 @@ fn extract_table(outer: &str, outer_upper: &str) -> Option<String> {
         return None;
     }
     // 最初のトークンを取得（空白区切り）
-    let mut token = from_clause.split_whitespace().next()?.to_string();
-    // バッククォート・ダブルクォートを剥がす
-    token = token
-        .trim_matches('`')
-        .trim_matches('"')
-        .trim_matches('\'')
-        .to_string();
+    let token_raw = from_clause.split_whitespace().next()?;
+    let token = strip_quotes(token_raw);
     if token.is_empty() {
         return None;
     }
     // スキーマ修飾: ドット区切りなら最後を table として採用
-    let table_part = if let Some(pos) = token.rfind('.') {
-        token[pos + 1..].to_string()
-    } else {
-        token
+    let table_part = match token.rfind('.') {
+        Some(pos) => &token[pos + 1..],
+        None => token,
     };
-    let table_part = table_part
-        .trim_matches('`')
-        .trim_matches('"')
-        .trim_matches('\'')
-        .to_string();
+    let table_part = strip_quotes(table_part);
     if table_part.is_empty() {
         return None;
     }
