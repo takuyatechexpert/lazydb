@@ -141,7 +141,7 @@ impl DbAdapter for MysqlAdapter {
                 ColumnInfo {
                     name: r.get::<String, _>("column_name"),
                     col_type: r.get::<String, _>("column_type"),
-                    is_primary_key: column_key == "PRI",
+                    is_primary_key: column_key.eq_ignore_ascii_case("PRI"),
                 }
             })
             .collect())
