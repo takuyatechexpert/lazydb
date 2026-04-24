@@ -43,6 +43,7 @@ pub struct TableEntry {
 pub struct ColumnEntry {
     pub name: String,
     pub col_type: String,
+    pub is_primary_key: bool,
 }
 
 impl SchemaState {
@@ -141,6 +142,36 @@ impl SchemaState {
         if self.loading || self.tables.iter().any(|t| t.columns_loading) {
             self.spinner_frame = (self.spinner_frame + 1) % 4;
         }
+    }
+
+    /// 指定テーブルの PK カラム名リストを返す。
+    /// - テーブル名の照合は `eq_ignore_ascii_case`
+    /// - 該当テーブルが未読込または存在しない場合 → None
+    /// - 展開済みで PK が無ければ Some(vec![])
+    pub fn primary_keys_for(&self, table: &str) -> Option<Vec<String>> {
+        let entry = self
+            .tables
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(table))?;
+        if !entry.columns_loaded {
+            return None;
+        }
+        let pks: Vec<String> = entry
+            .columns
+            .iter()
+            .filter(|c| c.is_primary_key)
+            .map(|c| c.name.clone())
+            .collect();
+        Some(pks)
+    }
+
+    /// 指定テーブルのカラムがロード済みか（照合は `eq_ignore_ascii_case`）
+    pub fn columns_loaded(&self, table: &str) -> bool {
+        self.tables
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(table))
+            .map(|t| t.columns_loaded)
+            .unwrap_or(false)
     }
 }
 

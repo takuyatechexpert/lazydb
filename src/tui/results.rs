@@ -1,4 +1,5 @@
 use crate::db::adapter::QueryResult;
+use crate::tui::cc_edit::CcEligibility;
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -32,6 +33,10 @@ pub struct ResultsState {
     pub auto_limited: bool,
     pub result: Option<QueryResult>,
     pub visible_width: usize,
+    /// 表示中の結果に対応するクエリ（cc 用）
+    pub last_query: Option<String>,
+    /// cc 機能の利用可否（描画・cc 押下時判定に使用）
+    pub cc_eligibility: CcEligibility,
 }
 
 impl ResultsState {
@@ -48,6 +53,8 @@ impl ResultsState {
             auto_limited: false,
             result: None,
             visible_width: 0,
+            last_query: None,
+            cc_eligibility: CcEligibility::NotSelect,
         }
     }
 
@@ -55,7 +62,7 @@ impl ResultsState {
         *self = Self::new();
     }
 
-    pub fn set_result(&mut self, result: QueryResult, auto_limited: bool) {
+    pub fn set_result(&mut self, result: QueryResult, auto_limited: bool, query: String) {
         self.total_rows = result.rows.len();
         self.duration_ms = result.duration_ms;
         self.columns = result.columns.clone();
@@ -65,7 +72,12 @@ impl ResultsState {
         self.scroll_offset = 0;
         self.h_scroll = 0;
         self.status = ResultStatus::Success;
+        self.last_query = Some(query);
         self.calculate_widths();
+    }
+
+    pub fn set_cc_eligibility(&mut self, eligibility: CcEligibility) {
+        self.cc_eligibility = eligibility;
     }
 
     pub fn set_error(&mut self, msg: String) {
@@ -275,10 +287,14 @@ fn render_table(f: &mut Frame, results: &ResultsState, is_focused: bool, area: R
     while lines.len() < area.height as usize - 1 {
         lines.push(Line::raw(""));
     }
-    lines.push(Line::from(Span::styled(
-        footer,
-        Style::default().fg(Color::DarkGray),
-    )));
+    lines.push(Line::from(vec![
+        Span::styled(footer, Style::default().fg(Color::DarkGray)),
+        Span::raw("  "),
+        Span::styled(
+            results.cc_eligibility.label().to_string(),
+            Style::default().fg(results.cc_eligibility.label_color()),
+        ),
+    ]));
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);

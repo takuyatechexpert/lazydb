@@ -1,3 +1,4 @@
+pub mod cc_edit;
 pub mod editor;
 pub mod help;
 pub mod layout;
@@ -29,6 +30,7 @@ use ratatui::{
     widgets::Paragraph,
     Frame, Terminal,
 };
+use cc_edit::{CcAnalysis, CcEligibility};
 use results::ResultsState;
 use schema::{ColumnEntry, SchemaState, TableEntry};
 use std::io;
@@ -44,6 +46,8 @@ pub struct Tab {
     pub name: String,
     pub editor: EditorState,
     pub results: ResultsState,
+    /// cc 2連打検出: このタブで Results フォーカス中に c が押された直後だけ true
+    pub pending_c: bool,
 }
 
 impl Tab {
@@ -53,6 +57,7 @@ impl Tab {
             name: "Query".to_string(),
             editor: EditorState::new(),
             results: ResultsState::new(),
+            pending_c: false,
         }
     }
 }
@@ -496,7 +501,10 @@ impl App {
                                     duration,
                                 );
                             }
-                            tab.results.set_result(qr, auto_limited);
+                            tab.results.set_result(qr, auto_limited, original_query.clone());
+                            let analysis = CcAnalysis::from_query(&original_query);
+                            let eligibility = cc_edit::compute_eligibility(&analysis, &self.schema);
+                            tab.results.set_cc_eligibility(eligibility);
                             self.status_message = Some(format!(
                                 "{} rows  ({:.3}s)",
                                 row_count,
@@ -506,6 +514,7 @@ impl App {
                         Err(e) => {
                             let msg = format!("{}", e);
                             tab.results.set_error(msg.clone());
+                            tab.results.set_cc_eligibility(CcEligibility::NotSelect);
                             self.status_message = Some(format!("エラー: {}", msg));
                         }
                     }
@@ -534,6 +543,7 @@ impl App {
                                 .map(|c| ColumnEntry {
                                     name: c.name,
                                     col_type: c.col_type,
+                                    is_primary_key: c.is_primary_key,
                                 })
                                 .collect();
                             table.columns_loaded = true;
@@ -727,12 +737,14 @@ impl App {
             }
             KeyCode::Tab => {
                 self.active_panel = self.active_panel.next();
+                self.tabs[self.active_tab].pending_c = false;
             }
             KeyCode::BackTab if self.active_panel == Panel::Editor && self.tabs[idx].editor.completion.active => {
                 self.handle_editor_key(key);
             }
             KeyCode::BackTab => {
                 self.active_panel = self.active_panel.prev();
+                self.tabs[self.active_tab].pending_c = false;
             }
             KeyCode::Char('?') if !(self.active_panel == Panel::Editor && self.tabs[idx].editor.mode == editor::EditorMode::Insert) => {
                 self.mode = AppMode::Help;
@@ -926,7 +938,17 @@ impl App {
 
     fn handle_results_key(&mut self, key: KeyEvent) {
         let idx = self.active_tab;
+        let was_pending = self.tabs[idx].pending_c;
+        // まず pending_c をリセット（c の場合だけ下で再設定）
+        self.tabs[idx].pending_c = false;
         match key.code {
+            KeyCode::Char('c') => {
+                if was_pending {
+                    self.try_execute_cc(idx);
+                } else {
+                    self.tabs[idx].pending_c = true;
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.tabs[idx].results.scroll_down();
             }
@@ -976,6 +998,25 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn try_execute_cc(&mut self, idx: usize) {
+        let tab = &mut self.tabs[idx];
+        match tab.results.cc_eligibility.clone() {
+            CcEligibility::Ok { table, pk_columns } => {
+                let Some(row) = tab.results.rows.get(tab.results.scroll_offset).cloned() else {
+                    self.status_message = Some("対象行がありません".to_string());
+                    return;
+                };
+                let columns = tab.results.columns.clone();
+                let sql = cc_edit::build_update_statement(&table, &columns, &row, &pk_columns);
+                tab.editor.append_text(&sql);
+                self.status_message = Some("UPDATE 文を Editor に追記しました".to_string());
+            }
+            other => {
+                self.status_message = Some(other.status_reason().to_string());
+            }
         }
     }
 
@@ -1401,6 +1442,9 @@ impl App {
             if conn_info.readonly {
                 if let Err(e) = ReadonlyChecker.check(&query) {
                     self.tabs[idx].results.set_error(format!("{}", e));
+                    self.tabs[idx]
+                        .results
+                        .set_cc_eligibility(CcEligibility::NotSelect);
                     self.status_message = Some(format!("{}", e));
                     return;
                 }

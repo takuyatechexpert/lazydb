@@ -19,6 +19,7 @@ pub struct TableInfo {
 pub struct ColumnInfo {
     pub name: String,
     pub col_type: String,
+    pub is_primary_key: bool,
 }
 
 /// DB アダプタートレイト

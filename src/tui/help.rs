@@ -77,6 +77,7 @@ pub fn render(f: &mut Frame, area: Rect) {
         help_line("Ctrl+D/Ctrl+U", "縦1ページ移動"),
         help_line("PgUp/PgDn", "縦1ページ移動"),
         help_line("y", "行データコピー"),
+        help_line("cc", "カーソル行の UPDATE 文を Editor に追記"),
     ];
 
     let paragraph = Paragraph::new(help_text).block(block);

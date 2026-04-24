@@ -125,6 +125,36 @@ impl EditorState {
         self.redo_stack.clear();
     }
 
+    /// カーソル位置に関係なく、バッファ末尾に text を追記する。
+    /// text が改行で始まっていない場合、末尾行が非空なら改行を挟む。
+    /// undo スナップショットを保存する。
+    pub fn append_text(&mut self, text: &str) {
+        self.save_snapshot();
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        // text が改行で始まらず、末尾行が非空なら改行（新しい空行）を挟む
+        let starts_with_newline = text.starts_with('\n');
+        let last_line_nonempty = self.lines.last().map(|l| !l.is_empty()).unwrap_or(false);
+        if !starts_with_newline && last_line_nonempty {
+            self.lines.push(String::new());
+        }
+        // text を行に分割（split('\n') は先頭/末尾の改行を空要素として保持する）
+        // 先頭は末尾行へ追記、残りは新しい行として追加
+        let mut parts = text.split('\n');
+        if let Some(first) = parts.next() {
+            let last = self.lines.last_mut().expect("lines is non-empty");
+            last.push_str(first);
+        }
+        for part in parts {
+            self.lines.push(part.to_string());
+        }
+        // カーソルを末尾に移動
+        let last_row = self.lines.len() - 1;
+        let last_col = char_count(&self.lines[last_row]);
+        self.cursor = (last_row, last_col);
+    }
+
     fn save_snapshot(&mut self) {
         self.undo_stack.push(EditorSnapshot {
             lines: self.lines.clone(),

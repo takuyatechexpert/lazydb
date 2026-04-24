@@ -128,8 +128,23 @@ impl DbAdapter for PostgresAdapter {
             .context("データベースに接続されていません")?;
 
         let rows = sqlx::query(
-            "SELECT column_name, data_type FROM information_schema.columns \
-             WHERE table_schema = 'public' AND table_name = $1 ORDER BY ordinal_position",
+            "SELECT \
+               c.column_name, \
+               c.data_type, \
+               CASE WHEN EXISTS ( \
+                 SELECT 1 \
+                 FROM pg_index i \
+                 JOIN pg_class cls ON cls.oid = i.indrelid \
+                 JOIN pg_namespace ns ON ns.oid = cls.relnamespace \
+                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+                 WHERE i.indisprimary \
+                   AND ns.nspname = c.table_schema \
+                   AND cls.relname = c.table_name \
+                   AND a.attname = c.column_name \
+               ) THEN TRUE ELSE FALSE END AS is_primary_key \
+             FROM information_schema.columns c \
+             WHERE c.table_schema = 'public' AND c.table_name = $1 \
+             ORDER BY c.ordinal_position",
         )
         .bind(table)
         .fetch_all(pool)
@@ -141,6 +156,7 @@ impl DbAdapter for PostgresAdapter {
             .map(|r| ColumnInfo {
                 name: r.get::<String, _>("column_name"),
                 col_type: r.get::<String, _>("data_type"),
+                is_primary_key: r.get::<bool, _>("is_primary_key"),
             })
             .collect())
     }

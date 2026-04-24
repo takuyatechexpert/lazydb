@@ -126,7 +126,7 @@ impl DbAdapter for MysqlAdapter {
             .context("データベースに接続されていません")?;
 
         let rows = sqlx::query(
-            "SELECT column_name, column_type FROM information_schema.columns \
+            "SELECT column_name, column_type, column_key FROM information_schema.columns \
              WHERE table_schema = DATABASE() AND table_name = ? ORDER BY ordinal_position",
         )
         .bind(table)
@@ -136,9 +136,13 @@ impl DbAdapter for MysqlAdapter {
 
         Ok(rows
             .iter()
-            .map(|r| ColumnInfo {
-                name: r.get::<String, _>("column_name"),
-                col_type: r.get::<String, _>("column_type"),
+            .map(|r| {
+                let column_key: String = r.get::<String, _>("column_key");
+                ColumnInfo {
+                    name: r.get::<String, _>("column_name"),
+                    col_type: r.get::<String, _>("column_type"),
+                    is_primary_key: column_key == "PRI",
+                }
             })
             .collect())
     }
