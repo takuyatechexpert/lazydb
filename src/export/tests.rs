@@ -68,7 +68,7 @@ fn parse_json_value_integer() {
 
 #[test]
 fn parse_json_value_float() {
-    assert_eq!(parse_json_value("3.14"), serde_json::json!(3.14));
+    assert_eq!(parse_json_value("1.25"), serde_json::json!(1.25));
 }
 
 #[test]

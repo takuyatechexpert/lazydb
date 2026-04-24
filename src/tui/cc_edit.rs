@@ -50,6 +50,7 @@ impl CcEligibility {
     }
 
     /// 編集可能か
+    #[allow(dead_code)]
     pub fn is_ok(&self) -> bool {
         matches!(self, CcEligibility::Ok { .. })
     }
@@ -489,80 +490,80 @@ mod tests {
     #[test]
     fn from_query_select_star() {
         let a = CcAnalysis::from_query("SELECT * FROM users");
-        assert_eq!(a.is_select, true);
+        assert!(a.is_select);
         assert_eq!(a.table.as_deref(), Some("users"));
-        assert_eq!(a.has_join, false);
-        assert_eq!(a.has_subquery, false);
-        assert_eq!(a.has_expression, false);
+        assert!(!a.has_join);
+        assert!(!a.has_subquery);
+        assert!(!a.has_expression);
     }
 
     /// SELECT id, name FROM users は複数カラムでも式なしの単一テーブル SELECT
     #[test]
     fn from_query_multiple_columns_no_expression() {
         let a = CcAnalysis::from_query("SELECT id, name FROM users");
-        assert_eq!(a.is_select, true);
+        assert!(a.is_select);
         assert_eq!(a.table.as_deref(), Some("users"));
-        assert_eq!(a.has_join, false);
-        assert_eq!(a.has_subquery, false);
-        assert_eq!(a.has_expression, false);
+        assert!(!a.has_join);
+        assert!(!a.has_subquery);
+        assert!(!a.has_expression);
     }
 
     /// 小文字 select・大文字テーブル名・前後空白に対して、テーブル名が小文字化される
     #[test]
     fn from_query_lowercase_and_whitespace() {
         let a = CcAnalysis::from_query("  select * from USERS  ");
-        assert_eq!(a.is_select, true);
+        assert!(a.is_select);
         assert_eq!(a.table.as_deref(), Some("users"));
-        assert_eq!(a.has_join, false);
-        assert_eq!(a.has_subquery, false);
-        assert_eq!(a.has_expression, false);
+        assert!(!a.has_join);
+        assert!(!a.has_subquery);
+        assert!(!a.has_expression);
     }
 
     /// スキーマ修飾 public.users はテーブル部分のみが採用される
     #[test]
     fn from_query_schema_qualified() {
         let a = CcAnalysis::from_query("SELECT id FROM public.users");
-        assert_eq!(a.is_select, true);
+        assert!(a.is_select);
         assert_eq!(a.table.as_deref(), Some("users"));
-        assert_eq!(a.has_join, false);
-        assert_eq!(a.has_subquery, false);
-        assert_eq!(a.has_expression, false);
+        assert!(!a.has_join);
+        assert!(!a.has_subquery);
+        assert!(!a.has_expression);
     }
 
     /// FROM users AS u の AS エイリアスは除去される
     #[test]
     fn from_query_table_alias_with_as() {
         let a = CcAnalysis::from_query("SELECT * FROM users AS u");
-        assert_eq!(a.is_select, true);
+        assert!(a.is_select);
         assert_eq!(a.table.as_deref(), Some("users"));
-        assert_eq!(a.has_join, false);
+        assert!(!a.has_join);
     }
 
     /// FROM users u の空白区切りエイリアスも除去される
     #[test]
     fn from_query_table_alias_without_as() {
         let a = CcAnalysis::from_query("SELECT * FROM users u");
-        assert_eq!(a.is_select, true);
+        assert!(a.is_select);
         assert_eq!(a.table.as_deref(), Some("users"));
-        assert_eq!(a.has_join, false);
+        assert!(!a.has_join);
     }
 
     /// JOIN を含むクエリは has_join=true、table=None
     #[test]
     fn from_query_inner_join() {
         let a = CcAnalysis::from_query("SELECT * FROM users JOIN orders ON u.id=o.uid");
-        assert_eq!(a.is_select, true);
+        assert!(a.is_select);
         assert_eq!(a.table, None);
-        assert_eq!(a.has_join, true);
-        assert_eq!(a.has_subquery, false);
+        assert!(a.has_join);
+        assert!(!a.has_subquery);
     }
 
     /// LEFT JOIN も has_join=true として検出される
     #[test]
     fn from_query_left_join() {
         let a = CcAnalysis::from_query("SELECT * FROM users LEFT JOIN orders ON u.id=o.uid");
-        assert_eq!(a.is_select, true);
-        assert_eq!(a.has_join, true);
+        assert!(a.is_select);
+        assert!(a.has_join);
         assert_eq!(a.table, None);
     }
 
@@ -570,8 +571,8 @@ mod tests {
     #[test]
     fn from_query_comma_join() {
         let a = CcAnalysis::from_query("SELECT * FROM users, orders");
-        assert_eq!(a.is_select, true);
-        assert_eq!(a.has_join, true);
+        assert!(a.is_select);
+        assert!(a.has_join);
         assert_eq!(a.table, None);
     }
 
@@ -580,9 +581,9 @@ mod tests {
     #[test]
     fn from_query_where_in_subquery_has_subquery() {
         let a = CcAnalysis::from_query("SELECT * FROM users WHERE id IN (SELECT id FROM t)");
-        assert_eq!(a.is_select, true);
-        assert_eq!(a.has_subquery, true);
-        assert_eq!(a.has_join, false);
+        assert!(a.is_select);
+        assert!(a.has_subquery);
+        assert!(!a.has_join);
         assert_eq!(a.table.as_deref(), Some("users"));
     }
 
@@ -590,8 +591,8 @@ mod tests {
     #[test]
     fn from_query_aggregate_function() {
         let a = CcAnalysis::from_query("SELECT COUNT(*) FROM users");
-        assert_eq!(a.is_select, true);
-        assert_eq!(a.has_expression, true);
+        assert!(a.is_select);
+        assert!(a.has_expression);
         assert_eq!(a.table.as_deref(), Some("users"));
     }
 
@@ -599,8 +600,8 @@ mod tests {
     #[test]
     fn from_query_arithmetic_expression() {
         let a = CcAnalysis::from_query("SELECT id + 1 FROM users");
-        assert_eq!(a.is_select, true);
-        assert_eq!(a.has_expression, true);
+        assert!(a.is_select);
+        assert!(a.has_expression);
         assert_eq!(a.table.as_deref(), Some("users"));
     }
 
@@ -608,8 +609,8 @@ mod tests {
     #[test]
     fn from_query_function_on_column() {
         let a = CcAnalysis::from_query("SELECT id, UPPER(name) FROM users");
-        assert_eq!(a.is_select, true);
-        assert_eq!(a.has_expression, true);
+        assert!(a.is_select);
+        assert!(a.has_expression);
         assert_eq!(a.table.as_deref(), Some("users"));
     }
 
@@ -617,22 +618,22 @@ mod tests {
     #[test]
     fn from_query_update_is_not_select() {
         let a = CcAnalysis::from_query("UPDATE users SET x=1");
-        assert_eq!(a.is_select, false);
+        assert!(!a.is_select);
         assert_eq!(a.table, None);
-        assert_eq!(a.has_join, false);
-        assert_eq!(a.has_subquery, false);
-        assert_eq!(a.has_expression, false);
+        assert!(!a.has_join);
+        assert!(!a.has_subquery);
+        assert!(!a.has_expression);
     }
 
     /// 空クエリは is_select=false・table=None
     #[test]
     fn from_query_empty() {
         let a = CcAnalysis::from_query("");
-        assert_eq!(a.is_select, false);
+        assert!(!a.is_select);
         assert_eq!(a.table, None);
-        assert_eq!(a.has_join, false);
-        assert_eq!(a.has_subquery, false);
-        assert_eq!(a.has_expression, false);
+        assert!(!a.has_join);
+        assert!(!a.has_subquery);
+        assert!(!a.has_expression);
     }
 
     // ── build_update_statement ──
@@ -877,22 +878,22 @@ mod tests {
     #[test]
     fn from_query_multibyte_in_expression_parens() {
         let a = CcAnalysis::from_query("SELECT (ああ) FROM t");
-        assert_eq!(a.is_select, true);
-        assert_eq!(a.has_expression, true);
+        assert!(a.is_select);
+        assert!(a.has_expression);
         assert_eq!(a.table.as_deref(), Some("t"));
-        assert_eq!(a.has_join, false);
-        assert_eq!(a.has_subquery, false);
+        assert!(!a.has_join);
+        assert!(!a.has_subquery);
     }
 
     /// WHERE 句のリテラルにマルチバイト文字を含んでも panic せず、table 抽出される
     #[test]
     fn from_query_multibyte_in_where_literal() {
         let a = CcAnalysis::from_query("SELECT * FROM users WHERE name = '日本語'");
-        assert_eq!(a.is_select, true);
-        assert_eq!(a.has_expression, false);
+        assert!(a.is_select);
+        assert!(!a.has_expression);
         assert_eq!(a.table.as_deref(), Some("users"));
-        assert_eq!(a.has_subquery, false);
-        assert_eq!(a.has_join, false);
+        assert!(!a.has_subquery);
+        assert!(!a.has_join);
     }
 
     /// サブクエリ内にマルチバイトリテラルがあっても panic せず、has_subquery=true・has_join=false
@@ -901,9 +902,9 @@ mod tests {
         let a = CcAnalysis::from_query(
             "SELECT * FROM users WHERE x IN (SELECT id FROM t WHERE name = 'あい')",
         );
-        assert_eq!(a.is_select, true);
-        assert_eq!(a.has_subquery, true);
-        assert_eq!(a.has_join, false);
+        assert!(a.is_select);
+        assert!(a.has_subquery);
+        assert!(!a.has_join);
         assert_eq!(a.table.as_deref(), Some("users"));
     }
 }

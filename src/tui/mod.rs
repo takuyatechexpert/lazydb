@@ -266,7 +266,7 @@ impl NewConnectionForm {
     }
 
     fn get(&self, key: &str) -> &str {
-        self.fields.iter().find(|(k, _)| *k == key).map(|&(_, ref v)| v.as_str()).unwrap_or("")
+        self.fields.iter().find(|(k, _)| *k == key).map(|(_, v)| v.as_str()).unwrap_or("")
     }
 
     /// 表示行数（type + db_type + フィールド数）
@@ -424,6 +424,7 @@ impl App {
         &self.tabs[self.active_tab].editor
     }
 
+    #[allow(dead_code)]
     pub fn active_results(&self) -> &ResultsState {
         &self.tabs[self.active_tab].results
     }

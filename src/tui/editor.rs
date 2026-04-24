@@ -432,7 +432,7 @@ impl EditorState {
                 i += 1;
             }
             if !next_chars.is_empty() {
-                let is_word = next_chars.get(i).map_or(false, |c| c.is_alphanumeric() || *c == '_');
+                let is_word = next_chars.get(i).is_some_and(|c| c.is_alphanumeric() || *c == '_');
                 while i + 1 < next_chars.len()
                     && ((next_chars[i + 1].is_alphanumeric() || next_chars[i + 1] == '_') == is_word)
                 {
