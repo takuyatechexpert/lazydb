@@ -1067,6 +1067,59 @@ mod tests {
         assert_eq!(e.lines, vec!["A"]);
     }
 
+    // ── append_text ──
+
+    #[test]
+    fn append_text_to_empty_editor() {
+        let mut e = EditorState::new();
+        e.append_text("SELECT 1");
+        assert_eq!(e.lines, vec!["SELECT 1"]);
+        assert_eq!(e.cursor, (0, 8));
+    }
+
+    #[test]
+    fn append_text_when_last_line_empty_appends_without_newline() {
+        let mut e = editor_with("SELECT 1;\n");
+        e.append_text("UPDATE t SET a=1;");
+        assert_eq!(e.lines, vec!["SELECT 1;", "UPDATE t SET a=1;"]);
+        assert_eq!(e.cursor, (1, 17));
+    }
+
+    #[test]
+    fn append_text_when_last_line_nonempty_inserts_newline() {
+        let mut e = editor_with("SELECT 1;");
+        e.append_text("UPDATE t SET a=1;");
+        assert_eq!(e.lines, vec!["SELECT 1;", "UPDATE t SET a=1;"]);
+        assert_eq!(e.cursor, (1, 17));
+    }
+
+    #[test]
+    fn append_text_with_leading_newline_does_not_insert_extra_newline() {
+        let mut e = editor_with("SELECT 1;");
+        e.append_text("\nUPDATE t SET a=1;");
+        assert_eq!(e.lines, vec!["SELECT 1;", "UPDATE t SET a=1;"]);
+        assert_eq!(e.cursor, (1, 17));
+    }
+
+    #[test]
+    fn append_text_with_embedded_newlines_creates_multiple_lines() {
+        let mut e = editor_with("A");
+        e.append_text("B\nC\nD");
+        assert_eq!(e.lines, vec!["A", "B", "C", "D"]);
+        assert_eq!(e.cursor, (3, 1));
+    }
+
+    #[test]
+    fn append_text_undo_restores_previous_state() {
+        let mut e = editor_with("SELECT 1;");
+        e.cursor = (0, 3);
+        e.append_text("UPDATE t SET a=1;");
+        assert_eq!(e.lines, vec!["SELECT 1;", "UPDATE t SET a=1;"]);
+        e.undo();
+        assert_eq!(e.lines, vec!["SELECT 1;"]);
+        assert_eq!(e.cursor, (0, 3));
+    }
+
     // ── move_word_forward (w) ──
 
     #[test]
