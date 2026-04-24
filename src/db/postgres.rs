@@ -7,6 +7,8 @@ use std::time::Instant;
 pub struct PostgresAdapter {
     pool: Option<PgPool>,
     connection_url: String,
+    /// 接続時の current_schema。未接続時は "public" を既定値として保持。
+    schema: String,
 }
 
 impl PostgresAdapter {
@@ -26,6 +28,7 @@ impl PostgresAdapter {
         Self {
             pool: None,
             connection_url,
+            schema: "public".to_string(),
         }
     }
 }
@@ -43,6 +46,14 @@ impl DbAdapter for PostgresAdapter {
             .execute(&pool)
             .await
             .context("PostgreSQL 疎通確認に失敗しました")?;
+
+        // search_path 先頭のスキーマを取得。search_path が空等で NULL が返る
+        // ケースに備え、取得失敗時は "public" にフォールバックする。
+        let current: Option<String> = sqlx::query_scalar("SELECT current_schema()::text")
+            .fetch_one(&pool)
+            .await
+            .context("current_schema の取得に失敗しました")?;
+        self.schema = current.unwrap_or_else(|| "public".to_string());
 
         self.pool = Some(pool);
         Ok(())
@@ -107,8 +118,9 @@ impl DbAdapter for PostgresAdapter {
 
         let rows = sqlx::query(
             "SELECT table_name FROM information_schema.tables \
-             WHERE table_schema = 'public' ORDER BY table_name",
+             WHERE table_schema = $1 ORDER BY table_name",
         )
+        .bind(&self.schema)
         .fetch_all(pool)
         .await
         .context("テーブル一覧の取得に失敗しました")?;
@@ -143,9 +155,10 @@ impl DbAdapter for PostgresAdapter {
                    AND a.attname = c.column_name \
                ) THEN TRUE ELSE FALSE END AS is_primary_key \
              FROM information_schema.columns c \
-             WHERE c.table_schema = 'public' AND c.table_name = $1 \
+             WHERE c.table_schema = $1 AND c.table_name = $2 \
              ORDER BY c.ordinal_position",
         )
+        .bind(&self.schema)
         .bind(table)
         .fetch_all(pool)
         .await
