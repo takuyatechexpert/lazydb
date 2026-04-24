@@ -89,18 +89,8 @@ impl CcAnalysis {
         }
 
         let upper = trimmed.to_ascii_uppercase();
-        let is_select = upper.starts_with("SELECT") || upper.starts_with("SELECT\t");
-        if !is_select {
-            // "SELECT" で始まらない場合も厳密にチェック（先頭が "SELECT" + ws）
-            let mut chars = upper.chars();
-            let starts_select = upper.starts_with("SELECT")
-                && chars
-                    .nth(6)
-                    .map(|c| c.is_whitespace() || c == '*')
-                    .unwrap_or(false);
-            if !starts_select {
-                return Self::empty();
-            }
+        if !starts_with_select_keyword(&upper) {
+            return Self::empty();
         }
 
         // has_subquery: 全体に `(\s*SELECT\b` が現れるか
@@ -287,6 +277,19 @@ fn next_clause_start(upper: &str) -> usize {
 /// 識別子を囲う引用符（バッククォート・ダブルクォート・シングルクォート）を剥がす
 fn strip_quotes(s: &str) -> &str {
     s.trim_matches('`').trim_matches('"').trim_matches('\'')
+}
+
+/// クエリが SELECT キーワードで始まっているか（識別子連結を排除）。
+/// 例: `SELECT * ...` は true、`SELECTFOO * ...` は false。
+fn starts_with_select_keyword(upper: &str) -> bool {
+    let Some(rest) = upper.strip_prefix("SELECT") else {
+        return false;
+    };
+    // SELECT 直後が空白 / '*' / end のいずれかなら真のキーワード
+    match rest.as_bytes().first() {
+        None => true,
+        Some(b) => b.is_ascii_whitespace() || *b == b'*',
+    }
 }
 
 fn extract_table(outer: &str, outer_upper: &str) -> Option<String> {
@@ -480,6 +483,29 @@ mod tests {
     }
 
     // ── CcAnalysis::from_query ──
+
+    /// SELECTFOO のような識別子連結は SELECT キーワードとして認識しない
+    #[test]
+    fn from_query_rejects_selectfoo_identifier() {
+        let a = CcAnalysis::from_query("SELECTFOO * FROM t");
+        assert!(!a.is_select);
+        assert!(a.table.is_none());
+    }
+
+    /// SELECT の直後が改行でも SELECT キーワードとして認識する
+    #[test]
+    fn from_query_accepts_select_followed_by_newline() {
+        let a = CcAnalysis::from_query("SELECT\n*\nFROM users");
+        assert!(a.is_select);
+        assert_eq!(a.table.as_deref(), Some("users"));
+    }
+
+    /// SELECT* のように空白なしで '*' が続く場合もキーワードとして認識する
+    #[test]
+    fn from_query_accepts_select_star_without_space() {
+        let a = CcAnalysis::from_query("SELECT*FROM users");
+        assert!(a.is_select);
+    }
 
     /// 単純な SELECT * FROM users は単一テーブル SELECT として認識される
     #[test]
