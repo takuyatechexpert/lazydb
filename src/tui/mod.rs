@@ -515,7 +515,6 @@ impl App {
                         Err(e) => {
                             let msg = format!("{}", e);
                             tab.results.set_error(msg.clone());
-                            tab.results.set_cc_eligibility(CcEligibility::NotSelect);
                             self.status_message = Some(format!("エラー: {}", msg));
                         }
                     }
@@ -1443,9 +1442,6 @@ impl App {
             if conn_info.readonly {
                 if let Err(e) = ReadonlyChecker.check(&query) {
                     self.tabs[idx].results.set_error(format!("{}", e));
-                    self.tabs[idx]
-                        .results
-                        .set_cc_eligibility(CcEligibility::NotSelect);
                     self.status_message = Some(format!("{}", e));
                     return;
                 }

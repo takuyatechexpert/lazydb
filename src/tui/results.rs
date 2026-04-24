@@ -86,6 +86,8 @@ impl ResultsState {
         self.col_widths.clear();
         self.scroll_offset = 0;
         self.status = ResultStatus::Error(msg);
+        // エラー時は cc 対象にならないのでラベルもリセット
+        self.cc_eligibility = CcEligibility::NotSelect;
     }
 
     fn calculate_widths(&mut self) {
