@@ -1002,22 +1002,20 @@ impl App {
     }
 
     fn try_execute_cc(&mut self, idx: usize) {
-        let tab = &mut self.tabs[idx];
-        match tab.results.cc_eligibility.clone() {
-            CcEligibility::Ok { table, pk_columns } => {
-                let Some(row) = tab.results.rows.get(tab.results.scroll_offset).cloned() else {
-                    self.status_message = Some("対象行がありません".to_string());
-                    return;
-                };
-                let columns = tab.results.columns.clone();
-                let sql = cc_edit::build_update_statement(&table, &columns, &row, &pk_columns);
-                tab.editor.append_text(&sql);
-                self.status_message = Some("UPDATE 文を Editor に追記しました".to_string());
-            }
-            other => {
-                self.status_message = Some(other.status_reason().to_string());
-            }
-        }
+        let tab = &self.tabs[idx];
+        let CcEligibility::Ok { table, pk_columns } = &tab.results.cc_eligibility else {
+            let msg = tab.results.cc_eligibility.status_reason().to_string();
+            self.status_message = Some(msg);
+            return;
+        };
+        let Some(row) = tab.results.rows.get(tab.results.scroll_offset) else {
+            self.status_message = Some("対象行がありません".to_string());
+            return;
+        };
+        let sql =
+            cc_edit::build_update_statement(table, &tab.results.columns, row, pk_columns);
+        self.tabs[idx].editor.append_text(&sql);
+        self.status_message = Some("UPDATE 文を Editor に追記しました".to_string());
     }
 
     fn handle_new_conn_key(&mut self, key: KeyEvent) -> std::ops::ControlFlow<()> {
