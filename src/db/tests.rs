@@ -67,6 +67,26 @@ fn limit_applier_disabled_when_zero() {
 }
 
 #[test]
+fn limit_applier_skips_when_limit_exists_in_formatted_query() {
+    // sqlformat で整形すると LIMIT が改行で囲まれるため、
+    // " LIMIT " / "\nLIMIT " のいずれにも一致せず誤って二重付与される回帰防止
+    let applier = LimitApplier { default_limit: 100 };
+    let formatted = "SELECT\n  *\nFROM\n  users\nLIMIT\n  10";
+    let (query, applied) = applier.apply(formatted);
+    assert_eq!(query, formatted);
+    assert!(!applied);
+}
+
+#[test]
+fn limit_applier_skips_when_fetch_first_exists_in_formatted_query() {
+    let applier = LimitApplier { default_limit: 100 };
+    let formatted = "SELECT\n  *\nFROM\n  users\nFETCH FIRST 10 ROWS ONLY";
+    let (query, applied) = applier.apply(formatted);
+    assert_eq!(query, formatted);
+    assert!(!applied);
+}
+
+#[test]
 fn limit_applier_handles_lowercase_select() {
     let applier = LimitApplier { default_limit: 100 };
     let (query, applied) = applier.apply("select * from users");

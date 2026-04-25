@@ -68,9 +68,14 @@ impl LimitApplier {
             return (query.to_string(), false);
         }
 
+        // フォーマット済みクエリ（改行を含む）でも検出できるよう、
+        // 連続する空白類をすべて単一スペースに正規化してから判定する
+        let normalized = format!(" {} ", upper.split_whitespace().collect::<Vec<_>>().join(" "));
+
         // すでに LIMIT / FETCH FIRST / TOP がある場合はスキップ
-        if upper.contains(" LIMIT ") || upper.contains("\nLIMIT ")
-            || upper.contains(" FETCH FIRST") || upper.contains(" TOP ")
+        if normalized.contains(" LIMIT ")
+            || normalized.contains(" FETCH FIRST ")
+            || normalized.contains(" TOP ")
         {
             return (query.to_string(), false);
         }
