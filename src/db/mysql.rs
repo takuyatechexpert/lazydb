@@ -78,14 +78,14 @@ impl DbAdapter for MysqlAdapter {
             .map(|c| c.name().to_string())
             .collect();
 
-        // 行データを文字列に変換
-        let result_rows: Vec<Vec<String>> = rows
+        // 行データを文字列に変換（NULL は None として保持）
+        let result_rows: Vec<Vec<Option<String>>> = rows
             .iter()
             .map(|row| {
                 columns
                     .iter()
                     .enumerate()
-                    .map(|(i, _)| get_mysql_value_as_string(row, i))
+                    .map(|(i, _)| get_mysql_value(row, i))
                     .collect()
             })
             .collect();
@@ -148,20 +148,20 @@ impl DbAdapter for MysqlAdapter {
     }
 }
 
-/// MySqlRow から文字列として値を取得する
-fn get_mysql_value_as_string(row: &sqlx::mysql::MySqlRow, index: usize) -> String {
+/// MySqlRow から表示用の値を取得する。NULL は `None`、それ以外は `Some(文字列)` を返す。
+fn get_mysql_value(row: &sqlx::mysql::MySqlRow, index: usize) -> Option<String> {
     use sqlx::TypeInfo;
     use sqlx::ValueRef;
 
     let value_ref = row.try_get_raw(index).unwrap();
     if value_ref.is_null() {
-        return String::new();
+        return None;
     }
 
     let type_info = value_ref.type_info();
     let type_name = type_info.name();
 
-    match type_name {
+    let s = match type_name {
         "BOOLEAN" | "TINYINT(1)" => row
             .try_get::<bool, _>(index)
             .map(|v| v.to_string())
@@ -174,16 +174,97 @@ fn get_mysql_value_as_string(row: &sqlx::mysql::MySqlRow, index: usize) -> Strin
             .try_get::<i64, _>(index)
             .map(|v| v.to_string())
             .unwrap_or_default(),
+        "TINYINT UNSIGNED" | "SMALLINT UNSIGNED" | "MEDIUMINT UNSIGNED" | "INT UNSIGNED" => row
+            .try_get::<u32, _>(index)
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        "BIGINT UNSIGNED" => row
+            .try_get::<u64, _>(index)
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        "YEAR" => row
+            .try_get::<u16, _>(index)
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
         "FLOAT" => row
             .try_get::<f32, _>(index)
             .map(|v| v.to_string())
             .unwrap_or_default(),
-        "DOUBLE" | "DECIMAL" => row
+        "DOUBLE" => row
             .try_get::<f64, _>(index)
             .map(|v| v.to_string())
+            .unwrap_or_default(),
+        "DECIMAL" | "NUMERIC" => row
+            .try_get::<sqlx::types::BigDecimal, _>(index)
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        "DATE" => row
+            .try_get::<sqlx::types::chrono::NaiveDate, _>(index)
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        "TIME" => row
+            .try_get::<sqlx::types::chrono::NaiveTime, _>(index)
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        "DATETIME" => row
+            .try_get::<sqlx::types::chrono::NaiveDateTime, _>(index)
+            .map(|v| v.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_default(),
+        "TIMESTAMP" => row
+            .try_get::<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>, _>(index)
+            .map(|v| v.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_default(),
+        "JSON" => row
+            .try_get::<sqlx::types::JsonValue, _>(index)
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BINARY" | "VARBINARY" => row
+            .try_get::<Vec<u8>, _>(index)
+            .map(|v| format_binary(&v))
             .unwrap_or_default(),
         _ => row
             .try_get::<String, _>(index)
             .unwrap_or_default(),
+    };
+    Some(s)
+}
+
+/// バイナリデータを 16 進文字列で表示する（先頭 32 byte で打ち切り）
+fn format_binary(bytes: &[u8]) -> String {
+    const MAX: usize = 32;
+    let head: String = bytes
+        .iter()
+        .take(MAX)
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    if bytes.len() > MAX {
+        format!("0x{}…({} bytes)", head, bytes.len())
+    } else {
+        format!("0x{}", head)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_binary_short_returns_hex_with_prefix() {
+        assert_eq!(format_binary(&[0xde, 0xad, 0xbe, 0xef]), "0xdeadbeef");
+    }
+
+    #[test]
+    fn format_binary_empty_returns_prefix_only() {
+        assert_eq!(format_binary(&[]), "0x");
+    }
+
+    #[test]
+    fn format_binary_truncates_long_bytes() {
+        let bytes = vec![0xab; 100];
+        let s = format_binary(&bytes);
+        assert!(s.starts_with("0x"));
+        assert!(s.contains("…(100 bytes)"));
+        // 0x + 32 byte * 2 hex = 66 文字までは含まれる
+        assert!(s.len() > 66);
     }
 }

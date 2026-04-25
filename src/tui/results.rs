@@ -8,7 +8,10 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// NULL セルの表示文字列
+pub const NULL_DISPLAY: &str = "NULL";
 
 // App / Panel は不要: render は ResultsState を直接受け取る
 
@@ -24,7 +27,8 @@ pub enum ResultStatus {
 #[derive(Debug, Clone)]
 pub struct ResultsState {
     pub columns: Vec<String>,
-    pub rows: Vec<Vec<String>>,
+    /// 行データ。`Option<String>` の `None` は SQL の NULL を表す。
+    pub rows: Vec<Vec<Option<String>>>,
     pub col_widths: Vec<usize>,
     pub scroll_offset: usize,
     pub h_scroll: usize,
@@ -101,8 +105,8 @@ impl ResultsState {
         for row in &self.rows {
             for (i, cell) in row.iter().enumerate() {
                 if i < self.col_widths.len() {
-                    self.col_widths[i] =
-                        self.col_widths[i].max(UnicodeWidthStr::width(cell.as_str()));
+                    let s = cell.as_deref().unwrap_or(NULL_DISPLAY);
+                    self.col_widths[i] = self.col_widths[i].max(UnicodeWidthStr::width(s));
                 }
             }
         }
@@ -169,7 +173,12 @@ impl ResultsState {
     }
 
     pub fn copy_current_row(&self) -> Option<String> {
-        self.rows.get(self.scroll_offset).map(|row| row.join(","))
+        self.rows.get(self.scroll_offset).map(|row| {
+            row.iter()
+                .map(|c| c.as_deref().unwrap_or(NULL_DISPLAY))
+                .collect::<Vec<&str>>()
+                .join(",")
+        })
     }
 }
 
@@ -307,21 +316,42 @@ fn render_table(f: &mut Frame, results: &ResultsState, is_focused: bool, area: R
 
     for i in start..end {
         let row = &results.rows[i];
-        let cells: Vec<String> = row
-            .iter()
-            .enumerate()
-            .map(|(j, cell)| pad_right(cell, results.col_widths.get(j).copied().unwrap_or(0)))
-            .collect();
-        let style = if i == results.scroll_offset && is_focused {
+        let row_focused = i == results.scroll_offset && is_focused;
+        let base_style = if row_focused {
             Style::default().fg(Color::Cyan)
         } else {
             Style::default()
         };
-        let row_full = format!(" {} ", cells.join(" │ "));
-        lines.push(Line::from(Span::styled(
-            slice_by_width(&row_full, h_scroll, visible_width),
-            style,
-        )));
+        let null_style = if row_focused {
+            // フォーカス行でも NULL は控えめに見せる（Cyan より一段暗い色）
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC)
+        } else {
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC)
+        };
+
+        // セグメント単位（スタイル付き文字列）に分解して Span を組み立てる
+        let mut segments: Vec<(String, Style)> = Vec::with_capacity(row.len() * 2 + 2);
+        // 先頭スペース
+        segments.push((" ".to_string(), base_style));
+        for (j, cell) in row.iter().enumerate() {
+            if j > 0 {
+                segments.push((" │ ".to_string(), base_style));
+            }
+            let width = results.col_widths.get(j).copied().unwrap_or(0);
+            match cell.as_deref() {
+                Some(s) => segments.push((pad_right(s, width), base_style)),
+                None => segments.push((pad_right(NULL_DISPLAY, width), null_style)),
+            }
+        }
+        // 末尾スペース
+        segments.push((" ".to_string(), base_style));
+
+        let spans = slice_segments_by_width(&segments, h_scroll, visible_width);
+        lines.push(Line::from(spans));
     }
 
     // フッター
@@ -360,7 +390,7 @@ fn slice_by_width(s: &str, skip: usize, max_width: usize) -> String {
     let mut skipped = 0;
 
     for ch in s.chars() {
-        let w = UnicodeWidthStr::width(ch.to_string().as_str());
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
         if skipped < skip {
             skipped += w;
             continue;
@@ -370,6 +400,44 @@ fn slice_by_width(s: &str, skip: usize, max_width: usize) -> String {
         }
         result.push(ch);
         current_width += w;
+    }
+
+    result
+}
+
+/// スタイル付きセグメント列を、横スクロール量と最大幅に従って切り出して `Span` 列を返す。
+///
+/// 各セグメントごとに `slice_by_width` 相当の処理を行いつつ、消費した幅を共有することで
+/// セル間の境界（`│`）でスタイルが切り替わっても一貫した位置決めを保つ。
+fn slice_segments_by_width(
+    segments: &[(String, Style)],
+    skip: usize,
+    max_width: usize,
+) -> Vec<Span<'static>> {
+    let mut result: Vec<Span<'static>> = Vec::new();
+    let mut skipped = 0;
+    let mut consumed = 0;
+
+    for (text, style) in segments {
+        if consumed >= max_width {
+            break;
+        }
+        let mut buf = String::new();
+        for ch in text.chars() {
+            let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if skipped < skip {
+                skipped += w;
+                continue;
+            }
+            if consumed + w > max_width {
+                break;
+            }
+            buf.push(ch);
+            consumed += w;
+        }
+        if !buf.is_empty() {
+            result.push(Span::styled(buf, *style));
+        }
     }
 
     result
@@ -391,7 +459,7 @@ mod tests {
         let mut r = ResultsState::new();
         r.columns = (0..cols).map(|i| format!("c{}", i)).collect();
         r.rows = (0..rows)
-            .map(|i| (0..cols).map(|j| format!("r{}_{}", i, j)).collect())
+            .map(|i| (0..cols).map(|j| Some(format!("r{}_{}", i, j))).collect())
             .collect();
         r.col_widths = vec![10; cols];
         r.status = ResultStatus::Success;

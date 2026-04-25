@@ -6,7 +6,19 @@ fn make_result(columns: Vec<&str>, rows: Vec<Vec<&str>>) -> QueryResult {
         columns: columns.into_iter().map(String::from).collect(),
         rows: rows
             .into_iter()
-            .map(|r| r.into_iter().map(String::from).collect())
+            .map(|r| r.into_iter().map(|v| Some(v.to_string())).collect())
+            .collect(),
+        duration_ms: 0,
+    }
+}
+
+/// `Option<&str>` を直接受け付けるヘルパー（NULL を含む結果を組み立てる用）
+fn make_result_opt(columns: Vec<&str>, rows: Vec<Vec<Option<&str>>>) -> QueryResult {
+    QueryResult {
+        columns: columns.into_iter().map(String::from).collect(),
+        rows: rows
+            .into_iter()
+            .map(|r| r.into_iter().map(|v| v.map(String::from)).collect())
             .collect(),
         duration_ms: 0,
     }
@@ -45,6 +57,30 @@ fn to_json_outputs_array_of_objects() {
     assert_eq!(parsed.len(), 1);
     assert_eq!(parsed[0]["id"], serde_json::json!(1));
     assert_eq!(parsed[0]["name"], serde_json::json!("Alice"));
+}
+
+/// NULL 値（`None`）は JSON では `null` として出力される（空文字列とは区別される）
+#[test]
+fn to_json_null_value_serializes_as_null() {
+    let result = make_result_opt(
+        vec!["id", "created_at"],
+        vec![vec![Some("1"), None]],
+    );
+    let json = to_json(&result).unwrap();
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed[0]["id"], serde_json::json!(1));
+    assert_eq!(parsed[0]["created_at"], serde_json::Value::Null);
+}
+
+/// NULL 値は CSV では空フィールドとして出力される
+#[test]
+fn to_csv_null_value_outputs_empty_field() {
+    let result = make_result_opt(
+        vec!["id", "name"],
+        vec![vec![Some("1"), None]],
+    );
+    let csv = to_csv(&result).unwrap();
+    assert_eq!(csv, "id,name\n1,\n");
 }
 
 // ── parse_json_value ──

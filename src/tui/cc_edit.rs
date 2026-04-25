@@ -419,24 +419,27 @@ pub fn compute_eligibility(analysis: &CcAnalysis, schema: &SchemaState) -> CcEli
     }
 }
 
-/// UPDATE 文を組み立てる
+/// UPDATE 文を組み立てる。
+///
+/// `row[i]` が `None` の場合は `col=NULL`（クォート無し）として出力する。
+/// PK の WHERE 条件で None になる場合も `col IS NULL` として出力する。
 pub fn build_update_statement(
     table: &str,
     columns: &[String],
-    row: &[String],
+    row: &[Option<String>],
     pk_columns: &[String],
 ) -> String {
     let set_parts: Vec<String> = columns
         .iter()
         .zip(row.iter())
-        .map(|(c, v)| format!("{}='{}'", c, escape_single_quote(v)))
+        .map(|(c, v)| format_assign(c, v.as_deref()))
         .collect();
     let where_parts: Vec<String> = pk_columns
         .iter()
         .map(|pk| {
             let idx = columns.iter().position(|c| c == pk);
-            let v = idx.and_then(|i| row.get(i)).map(|s| s.as_str()).unwrap_or("");
-            format!("{}='{}'", pk, escape_single_quote(v))
+            let v = idx.and_then(|i| row.get(i)).and_then(|x| x.as_deref());
+            format_where(pk, v)
         })
         .collect();
     format!(
@@ -445,6 +448,23 @@ pub fn build_update_statement(
         set_parts.join(", "),
         where_parts.join(" AND ")
     )
+}
+
+/// SET 句の 1 カラム分。NULL は `col=NULL`（クォート無し）として出力する。
+fn format_assign(col: &str, value: Option<&str>) -> String {
+    match value {
+        Some(v) => format!("{}='{}'", col, escape_single_quote(v)),
+        None => format!("{}=NULL", col),
+    }
+}
+
+/// WHERE 句の 1 カラム分。NULL は `col IS NULL` として出力する
+/// （`col=NULL` は SQL 標準では常に未知になるため）。
+fn format_where(col: &str, value: Option<&str>) -> String {
+    match value {
+        Some(v) => format!("{}='{}'", col, escape_single_quote(v)),
+        None => format!("{} IS NULL", col),
+    }
 }
 
 fn escape_single_quote(s: &str) -> String {
@@ -670,7 +690,7 @@ mod tests {
         let sql = build_update_statement(
             "users",
             &["id".to_string(), "name".to_string()],
-            &["1".to_string(), "alice".to_string()],
+            &[Some("1".to_string()), Some("alice".to_string())],
             &["id".to_string()],
         );
         assert_eq!(sql, "UPDATE users SET id='1', name='alice' WHERE id='1';");
@@ -682,7 +702,7 @@ mod tests {
         let sql = build_update_statement(
             "t",
             &["a".to_string(), "b".to_string()],
-            &["x".to_string(), "y".to_string()],
+            &[Some("x".to_string()), Some("y".to_string())],
             &["a".to_string(), "b".to_string()],
         );
         assert_eq!(sql, "UPDATE t SET a='x', b='y' WHERE a='x' AND b='y';");
@@ -694,22 +714,50 @@ mod tests {
         let sql = build_update_statement(
             "t",
             &["n".to_string()],
-            &["O'Brien".to_string()],
+            &[Some("O'Brien".to_string())],
             &["n".to_string()],
         );
         assert_eq!(sql, "UPDATE t SET n='O''Brien' WHERE n='O''Brien';");
     }
 
-    /// 空文字の値は '' として出力される
+    /// 空文字の値は '' として出力される（NULL とは区別される）
     #[test]
     fn build_update_empty_value() {
         let sql = build_update_statement(
             "t",
             &["n".to_string()],
-            &["".to_string()],
+            &[Some("".to_string())],
             &["n".to_string()],
         );
         assert_eq!(sql, "UPDATE t SET n='' WHERE n='';");
+    }
+
+    /// NULL 値（None）は SET 句では `col=NULL`、PK の WHERE 句では `col IS NULL` として出力される。
+    /// timestamptz など空文字を受け付けない型を含む行で UPDATE が失敗しないことを保証する。
+    #[test]
+    fn build_update_null_value_emits_null_keyword() {
+        let sql = build_update_statement(
+            "events",
+            &["id".to_string(), "created_at".to_string()],
+            &[Some("42".to_string()), None],
+            &["id".to_string()],
+        );
+        assert_eq!(
+            sql,
+            "UPDATE events SET id='42', created_at=NULL WHERE id='42';"
+        );
+    }
+
+    /// PK 自体が NULL の場合、WHERE 句は `col IS NULL` になる（`col=NULL` は常に未知のため）。
+    #[test]
+    fn build_update_null_pk_uses_is_null_in_where() {
+        let sql = build_update_statement(
+            "t",
+            &["id".to_string(), "name".to_string()],
+            &[None, Some("x".to_string())],
+            &["id".to_string()],
+        );
+        assert_eq!(sql, "UPDATE t SET id=NULL, name='x' WHERE id IS NULL;");
     }
 
     // ── compute_eligibility の各バリアント網羅 ──

@@ -26,7 +26,7 @@ rpassword    = "7"
 chrono       = { version = "0.4", features = ["serde"] }
 dirs         = "5"
 keyring      = "3"
-sqlx         = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "mysql"] }
+sqlx         = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "mysql", "chrono", "uuid", "json", "bigdecimal"] }
 urlencoding  = "2"
 sqlformat    = "0.3"
 

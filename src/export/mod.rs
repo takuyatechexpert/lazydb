@@ -9,7 +9,9 @@ pub fn to_csv(result: &QueryResult) -> Result<String> {
     let mut wtr = csv::Writer::from_writer(Vec::new());
     wtr.write_record(&result.columns)?;
     for row in &result.rows {
-        wtr.write_record(row)?;
+        // CSV には NULL リテラルが無いため、NULL は空フィールドとして書き出す
+        let cells: Vec<&str> = row.iter().map(|c| c.as_deref().unwrap_or("")).collect();
+        wtr.write_record(&cells)?;
     }
     let bytes = wtr.into_inner()?;
     Ok(String::from_utf8(bytes)?)
@@ -25,7 +27,12 @@ pub fn to_json(result: &QueryResult) -> Result<String> {
                 .iter()
                 .zip(row.iter())
                 .map(|(k, v)| {
-                    let val = parse_json_value(v);
+                    // SQL の NULL は JSON の null として出力する。
+                    // 値があれば従来通り bool/数値/文字列を推測する。
+                    let val = match v {
+                        None => serde_json::Value::Null,
+                        Some(s) => parse_json_value(s),
+                    };
                     (k.clone(), val)
                 })
                 .collect();

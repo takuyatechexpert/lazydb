@@ -91,14 +91,14 @@ impl DbAdapter for PostgresAdapter {
             .map(|c| c.name().to_string())
             .collect();
 
-        // 行データを文字列に変換
-        let result_rows: Vec<Vec<String>> = rows
+        // 行データを文字列に変換（NULL は None として保持）
+        let result_rows: Vec<Vec<Option<String>>> = rows
             .iter()
             .map(|row| {
                 columns
                     .iter()
                     .enumerate()
-                    .map(|(i, _)| get_pg_value_as_string(row, i))
+                    .map(|(i, _)| get_pg_value(row, i))
                     .collect()
             })
             .collect();
@@ -175,20 +175,20 @@ impl DbAdapter for PostgresAdapter {
     }
 }
 
-/// PgRow から文字列として値を取得する
-fn get_pg_value_as_string(row: &sqlx::postgres::PgRow, index: usize) -> String {
+/// PgRow から表示用の値を取得する。NULL は `None`、それ以外は `Some(文字列)` を返す。
+fn get_pg_value(row: &sqlx::postgres::PgRow, index: usize) -> Option<String> {
     use sqlx::TypeInfo;
     use sqlx::ValueRef;
 
     let value_ref = row.try_get_raw(index).unwrap();
     if value_ref.is_null() {
-        return String::new();
+        return None;
     }
 
     let type_info = value_ref.type_info();
     let type_name = type_info.name();
 
-    match type_name {
+    let s = match type_name {
         "BOOL" => row
             .try_get::<bool, _>(index)
             .map(|v| v.to_string())
@@ -209,12 +209,142 @@ fn get_pg_value_as_string(row: &sqlx::postgres::PgRow, index: usize) -> String {
             .try_get::<f32, _>(index)
             .map(|v| v.to_string())
             .unwrap_or_default(),
-        "FLOAT8" | "NUMERIC" => row
+        "FLOAT8" => row
             .try_get::<f64, _>(index)
             .map(|v| v.to_string())
             .unwrap_or_default(),
+        "NUMERIC" => row
+            .try_get::<sqlx::types::BigDecimal, _>(index)
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        "DATE" => row
+            .try_get::<sqlx::types::chrono::NaiveDate, _>(index)
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        "TIME" => row
+            .try_get::<sqlx::types::chrono::NaiveTime, _>(index)
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        "TIMETZ" => row
+            .try_get::<sqlx::postgres::types::PgTimeTz, _>(index)
+            .map(|v| format!("{} {}", v.time, v.offset))
+            .unwrap_or_default(),
+        "TIMESTAMP" => row
+            .try_get::<sqlx::types::chrono::NaiveDateTime, _>(index)
+            .map(|v| v.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_default(),
+        "TIMESTAMPTZ" => row
+            .try_get::<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>, _>(index)
+            .map(|v| v.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_default(),
+        "INTERVAL" => row
+            .try_get::<sqlx::postgres::types::PgInterval, _>(index)
+            .map(|v| format!(
+                "{} months {} days {} micros",
+                v.months, v.days, v.microseconds
+            ))
+            .unwrap_or_default(),
+        "UUID" => row
+            .try_get::<sqlx::types::Uuid, _>(index)
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        "JSON" | "JSONB" => row
+            .try_get::<sqlx::types::JsonValue, _>(index)
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        "BYTEA" => row
+            .try_get::<Vec<u8>, _>(index)
+            .map(|v| format_binary(&v))
+            .unwrap_or_default(),
+        "OID" => row
+            .try_get::<sqlx::postgres::types::Oid, _>(index)
+            .map(|v| v.0.to_string())
+            .unwrap_or_default(),
+        // 配列型: TEXT[], INT4[] など末尾 "[]"
+        t if t.ends_with("[]") => format_pg_array(row, index, t),
         _ => row
             .try_get::<String, _>(index)
             .unwrap_or_default(),
+    };
+    Some(s)
+}
+
+/// バイナリデータを 16 進文字列で表示する（先頭 32 byte で打ち切り）
+fn format_binary(bytes: &[u8]) -> String {
+    const MAX: usize = 32;
+    let head: String = bytes
+        .iter()
+        .take(MAX)
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    if bytes.len() > MAX {
+        format!("0x{}…({} bytes)", head, bytes.len())
+    } else {
+        format!("0x{}", head)
+    }
+}
+
+/// PostgreSQL の配列型を簡易フォーマットする
+fn format_pg_array(row: &sqlx::postgres::PgRow, index: usize, type_name: &str) -> String {
+    let elem = type_name.trim_end_matches("[]");
+    match elem {
+        "BOOL" => row
+            .try_get::<Vec<bool>, _>(index)
+            .map(|v| format!("{:?}", v))
+            .unwrap_or_default(),
+        "INT2" => row
+            .try_get::<Vec<i16>, _>(index)
+            .map(|v| format!("{:?}", v))
+            .unwrap_or_default(),
+        "INT4" => row
+            .try_get::<Vec<i32>, _>(index)
+            .map(|v| format!("{:?}", v))
+            .unwrap_or_default(),
+        "INT8" => row
+            .try_get::<Vec<i64>, _>(index)
+            .map(|v| format!("{:?}", v))
+            .unwrap_or_default(),
+        "FLOAT4" => row
+            .try_get::<Vec<f32>, _>(index)
+            .map(|v| format!("{:?}", v))
+            .unwrap_or_default(),
+        "FLOAT8" => row
+            .try_get::<Vec<f64>, _>(index)
+            .map(|v| format!("{:?}", v))
+            .unwrap_or_default(),
+        "TEXT" | "VARCHAR" | "BPCHAR" | "NAME" | "CHAR" => row
+            .try_get::<Vec<String>, _>(index)
+            .map(|v| format!("{:?}", v))
+            .unwrap_or_default(),
+        "UUID" => row
+            .try_get::<Vec<sqlx::types::Uuid>, _>(index)
+            .map(|v| format!("{:?}", v))
+            .unwrap_or_default(),
+        _ => row
+            .try_get::<Vec<String>, _>(index)
+            .map(|v| format!("{:?}", v))
+            .unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_binary_short_returns_hex_with_prefix() {
+        assert_eq!(format_binary(&[0x01, 0x02, 0x03]), "0x010203");
+    }
+
+    #[test]
+    fn format_binary_empty_returns_prefix_only() {
+        assert_eq!(format_binary(&[]), "0x");
+    }
+
+    #[test]
+    fn format_binary_truncates_long_bytes() {
+        let bytes = vec![0xff; 50];
+        let s = format_binary(&bytes);
+        assert!(s.contains("…(50 bytes)"));
     }
 }

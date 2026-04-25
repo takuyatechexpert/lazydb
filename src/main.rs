@@ -265,12 +265,16 @@ fn print_table(result: &QueryResult, auto_limited: bool) -> Result<()> {
         return Ok(());
     }
 
+    // CLI 出力では NULL を `NULL` として表示する（空文字列と区別できるように）
+    const NULL_DISPLAY: &str = "NULL";
+
     // カラム幅計算（ヘッダーと各セルの最大幅）
     let mut widths: Vec<usize> = result.columns.iter().map(|c| UnicodeWidthStr::width(c.as_str())).collect();
     for row in &result.rows {
         for (i, cell) in row.iter().enumerate() {
             if i < widths.len() {
-                widths[i] = widths[i].max(UnicodeWidthStr::width(cell.as_str()));
+                let s = cell.as_deref().unwrap_or(NULL_DISPLAY);
+                widths[i] = widths[i].max(UnicodeWidthStr::width(s));
             }
         }
     }
@@ -288,7 +292,10 @@ fn print_table(result: &QueryResult, auto_limited: bool) -> Result<()> {
     // データ行
     for row in &result.rows {
         let cells: Vec<String> = row.iter().enumerate()
-            .map(|(i, cell)| pad_right(cell, widths.get(i).copied().unwrap_or(0)))
+            .map(|(i, cell)| {
+                let s = cell.as_deref().unwrap_or(NULL_DISPLAY);
+                pad_right(s, widths.get(i).copied().unwrap_or(0))
+            })
             .collect();
         println!(" {} ", cells.join(" | "));
     }
@@ -305,7 +312,9 @@ fn print_csv(result: &QueryResult) -> Result<()> {
     let mut wtr = csv::Writer::from_writer(std::io::stdout());
     wtr.write_record(&result.columns)?;
     for row in &result.rows {
-        wtr.write_record(row)?;
+        // CSV には NULL リテラルが無いため、NULL は空フィールドとして書き出す
+        let cells: Vec<&str> = row.iter().map(|c| c.as_deref().unwrap_or("")).collect();
+        wtr.write_record(&cells)?;
     }
     wtr.flush()?;
     Ok(())
@@ -315,7 +324,13 @@ fn print_json(result: &QueryResult) -> Result<()> {
     let records: Vec<serde_json::Value> = result.rows.iter().map(|row| {
         let obj: serde_json::Map<String, serde_json::Value> = result.columns.iter()
             .zip(row.iter())
-            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .map(|(k, v)| {
+                let val = match v {
+                    Some(s) => serde_json::Value::String(s.clone()),
+                    None => serde_json::Value::Null,
+                };
+                (k.clone(), val)
+            })
             .collect();
         serde_json::Value::Object(obj)
     }).collect();

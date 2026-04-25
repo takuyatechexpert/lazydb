@@ -336,7 +336,7 @@ fn make_results(rows: usize) -> results::ResultsState {
     let mut r = results::ResultsState::new();
     r.columns = vec!["a".to_string(), "b".to_string()];
     r.rows = (0..rows)
-        .map(|i| vec![format!("r{}_a", i), format!("r{}_b", i)])
+        .map(|i| vec![Some(format!("r{}_a", i)), Some(format!("r{}_b", i))])
         .collect();
     r.col_widths = vec![10, 10];
     r.status = results::ResultStatus::Success;

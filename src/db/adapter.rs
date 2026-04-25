@@ -1,10 +1,13 @@
 use anyhow::Result;
 
 /// クエリ結果
+///
+/// `rows[r][c]` は NULL を `None`、それ以外を `Some(表示用文字列)` で保持する。
+/// 表示・export・cc UPDATE 生成側で NULL を区別して扱えるようにするため。
 #[derive(Debug, Clone)]
 pub struct QueryResult {
     pub columns: Vec<String>,
-    pub rows: Vec<Vec<String>>,
+    pub rows: Vec<Vec<Option<String>>>,
     pub duration_ms: u64,
 }
 
