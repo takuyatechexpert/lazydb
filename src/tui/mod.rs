@@ -5,6 +5,7 @@ pub mod layout;
 pub mod picker;
 pub mod results;
 pub mod schema;
+pub mod scrollable;
 
 use crate::config::config::AppConfig;
 use crate::config::connections::{ConnectionConfig, DbType};
@@ -749,20 +750,6 @@ impl App {
             return std::ops::ControlFlow::Continue(());
         }
 
-        // Ctrl+D / Ctrl+U: Results 縦ページ移動
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
-            if self.active_panel == Panel::Results {
-                self.tabs[idx].results.page_down(20);
-            }
-            return std::ops::ControlFlow::Continue(());
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
-            if self.active_panel == Panel::Results {
-                self.tabs[idx].results.page_up(20);
-            }
-            return std::ops::ControlFlow::Continue(());
-        }
-
         // Ctrl+R: redo（Editor Normal モードのみ）
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
             if self.active_panel == Panel::Editor
@@ -804,13 +791,10 @@ impl App {
     }
 
     fn handle_schema_key(&mut self, key: KeyEvent) {
+        if scrollable::dispatch_scroll_key(&mut self.schema, &key, 20) {
+            return;
+        }
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.schema.move_down();
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.schema.move_up();
-            }
             KeyCode::Enter => {
                 if let Some(result) = self.schema.toggle_expand() {
                     match result {
@@ -869,14 +853,11 @@ impl App {
 
     fn handle_editor_normal_key(&mut self, key: KeyEvent) {
         let idx = self.active_tab;
-        // pending_g の処理: 前回 g が押されていたら gg として処理
-        if self.tabs[idx].editor.pending_g {
-            self.tabs[idx].editor.pending_g = false;
-            if key.code == KeyCode::Char('g') {
-                self.tabs[idx].editor.move_to_top();
-                return;
-            }
-            // g + 他のキーは無視して通常処理に fallthrough
+        // 共通スクロール・画面移動キー（h/j/k/l/g/G/0/$/PageUp/PageDown/Ctrl+D/Ctrl+U/H/L/Home/End/矢印）
+        // を先に dispatch する。dispatch を冒頭に置くことで Char('d')(ctrl=false) は dispatch を素通りし、
+        // 下の match arm の delete_line() に到達する。Ctrl+D は dispatch で page_down として消費される。
+        if scrollable::dispatch_scroll_key(&mut self.tabs[idx].editor, &key, 20) {
+            return;
         }
 
         match key.code {
@@ -886,21 +867,11 @@ impl App {
             KeyCode::Char('A') => self.tabs[idx].editor.enter_insert_end(),
             KeyCode::Char('o') => self.tabs[idx].editor.enter_insert_below(),
             KeyCode::Char('O') => self.tabs[idx].editor.enter_insert_above(),
-            // カーソル移動
-            KeyCode::Char('h') | KeyCode::Left => self.tabs[idx].editor.move_left(),
-            KeyCode::Char('l') | KeyCode::Right => self.tabs[idx].editor.move_right(),
-            KeyCode::Char('j') | KeyCode::Down => self.tabs[idx].editor.move_down(),
-            KeyCode::Char('k') | KeyCode::Up => self.tabs[idx].editor.move_up(),
+            // 単語移動
             KeyCode::Char('w') => self.tabs[idx].editor.move_word_forward(),
             KeyCode::Char('b') => self.tabs[idx].editor.move_word_back(),
             KeyCode::Char('e') => self.tabs[idx].editor.move_word_end(),
-            KeyCode::Char('0') | KeyCode::Home => self.tabs[idx].editor.move_home(),
-            KeyCode::Char('$') | KeyCode::End => self.tabs[idx].editor.move_end(),
             KeyCode::Char('^') => self.tabs[idx].editor.move_first_non_blank(),
-            KeyCode::Char('g') => {
-                self.tabs[idx].editor.pending_g = true;
-            }
-            KeyCode::Char('G') => self.tabs[idx].editor.move_to_bottom(),
             // 編集
             KeyCode::Char('x') => self.tabs[idx].editor.delete_char_at_cursor(),
             KeyCode::Char('d') => {
@@ -992,6 +963,10 @@ impl App {
         let was_pending = self.tabs[idx].pending_c;
         // まず pending_c をリセット（c の場合だけ下で再設定）
         self.tabs[idx].pending_c = false;
+        // 共通スクロール・画面移動キーを先に dispatch する
+        if scrollable::dispatch_scroll_key(&mut self.tabs[idx].results, &key, 20) {
+            return;
+        }
         match key.code {
             KeyCode::Char('c') => {
                 if was_pending {
@@ -999,42 +974,6 @@ impl App {
                 } else {
                     self.tabs[idx].pending_c = true;
                 }
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.tabs[idx].results.scroll_down();
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.tabs[idx].results.scroll_up();
-            }
-            KeyCode::Char('l') | KeyCode::Right => {
-                self.tabs[idx].results.scroll_right(4);
-            }
-            KeyCode::Char('h') | KeyCode::Left => {
-                self.tabs[idx].results.scroll_left(4);
-            }
-            KeyCode::Char('g') => {
-                self.tabs[idx].results.scroll_to_top();
-            }
-            KeyCode::Char('G') => {
-                self.tabs[idx].results.scroll_to_bottom();
-            }
-            KeyCode::Home | KeyCode::Char('0') => {
-                self.tabs[idx].results.h_scroll_home();
-            }
-            KeyCode::End | KeyCode::Char('$') => {
-                self.tabs[idx].results.h_scroll_end();
-            }
-            KeyCode::PageDown => {
-                self.tabs[idx].results.page_down(20);
-            }
-            KeyCode::PageUp => {
-                self.tabs[idx].results.page_up(20);
-            }
-            KeyCode::Char('L') => {
-                self.tabs[idx].results.h_page_right();
-            }
-            KeyCode::Char('H') => {
-                self.tabs[idx].results.h_page_left();
             }
             KeyCode::Char('y') => {
                 if let Some(csv) = self.tabs[idx].results.copy_current_row() {

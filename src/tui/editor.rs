@@ -1,3 +1,4 @@
+use crate::tui::scrollable::Scrollable;
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -92,8 +93,6 @@ pub struct EditorState {
     /// 横スクロール（カーソル列が画面幅を超えた場合のオフセット）
     pub h_scroll_offset: usize,
     pub mode: EditorMode,
-    /// gg コマンド用: 直前に g が押されたか
-    pub pending_g: bool,
     undo_stack: Vec<EditorSnapshot>,
     redo_stack: Vec<EditorSnapshot>,
     /// クエリ実行中
@@ -110,7 +109,6 @@ impl EditorState {
             scroll_offset: 0,
             h_scroll_offset: 0,
             mode: EditorMode::Normal,
-            pending_g: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             executing: false,
@@ -294,7 +292,6 @@ impl EditorState {
     /// Insert モードに遷移
     pub fn enter_insert(&mut self) {
         self.mode = EditorMode::Insert;
-        self.pending_g = false;
     }
 
     /// Insert モード: カーソルの右（append）
@@ -333,7 +330,6 @@ impl EditorState {
     /// Normal モードに戻る
     pub fn enter_normal(&mut self) {
         self.mode = EditorMode::Normal;
-        self.pending_g = false;
         // vim の挙動: Insert → Normal でカーソルが1つ左に戻る
         let line_chars = char_count(&self.lines[self.cursor.0]);
         if self.cursor.1 > 0 && self.cursor.1 >= line_chars && line_chars > 0 {
@@ -465,6 +461,31 @@ impl EditorState {
     pub fn move_to_bottom(&mut self) {
         self.cursor.0 = self.lines.len().saturating_sub(1);
         self.cursor.1 = 0;
+    }
+
+    /// 縦ページダウン: cursor 行を `page_size` 単位下げ、列を行幅にクランプ
+    pub fn move_page_down(&mut self, page_size: usize) {
+        self.cursor.0 = (self.cursor.0 + page_size).min(self.lines.len().saturating_sub(1));
+        let line_chars = char_count(&self.lines[self.cursor.0]);
+        self.cursor.1 = self.cursor.1.min(line_chars);
+    }
+
+    /// 縦ページアップ: cursor 行を `page_size` 単位上げ、列を行幅にクランプ
+    pub fn move_page_up(&mut self, page_size: usize) {
+        self.cursor.0 = self.cursor.0.saturating_sub(page_size);
+        let line_chars = char_count(&self.lines[self.cursor.0]);
+        self.cursor.1 = self.cursor.1.min(line_chars);
+    }
+
+    /// 横ページ左: cursor 列を 40 単位戻す
+    pub fn move_h_page_left(&mut self) {
+        self.cursor.1 = self.cursor.1.saturating_sub(40);
+    }
+
+    /// 横ページ右: cursor 列を 40 単位進める（行幅にクランプ）
+    pub fn move_h_page_right(&mut self) {
+        let line_chars = char_count(&self.lines[self.cursor.0]);
+        self.cursor.1 = (self.cursor.1 + 40).min(line_chars);
     }
 
     /// カーソル下の1文字を削除 (x)
@@ -784,6 +805,56 @@ impl EditorState {
         } else {
             self.h_scroll_offset = 0;
         }
+    }
+}
+
+impl Scrollable for EditorState {
+    fn move_one_down(&mut self) {
+        self.move_down();
+    }
+
+    fn move_one_up(&mut self) {
+        self.move_up();
+    }
+
+    fn move_one_left(&mut self) {
+        self.move_left();
+    }
+
+    fn move_one_right(&mut self) {
+        self.move_right();
+    }
+
+    fn scroll_to_top(&mut self) {
+        self.move_to_top();
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        self.move_to_bottom();
+    }
+
+    fn h_scroll_home(&mut self) {
+        self.move_home();
+    }
+
+    fn h_scroll_end(&mut self) {
+        self.move_end();
+    }
+
+    fn page_down(&mut self, page_size: usize) {
+        self.move_page_down(page_size);
+    }
+
+    fn page_up(&mut self, page_size: usize) {
+        self.move_page_up(page_size);
+    }
+
+    fn h_page_left(&mut self) {
+        self.move_h_page_left();
+    }
+
+    fn h_page_right(&mut self) {
+        self.move_h_page_right();
     }
 }
 
@@ -1408,5 +1479,249 @@ mod tests {
         e.cursor = (0, 3);
         e.adjust_scroll(10, 10);
         assert_eq!(e.h_scroll_offset, 0);
+    }
+
+    // ── move_page_down ──
+
+    fn editor_with_lines(n: usize) -> EditorState {
+        let text: Vec<String> = (0..n).map(|i| format!("line{}", i)).collect();
+        editor_with(&text.join("\n"))
+    }
+
+    #[test]
+    fn move_page_down_advances_cursor_by_page_size() {
+        let mut e = editor_with_lines(50);
+        e.cursor = (0, 0);
+        e.move_page_down(20);
+        assert_eq!(e.cursor.0, 20);
+        assert_eq!(e.cursor.1, 0);
+    }
+
+    #[test]
+    fn move_page_down_clamps_at_last_line() {
+        let mut e = editor_with_lines(10);
+        e.cursor = (5, 0);
+        e.move_page_down(20);
+        assert_eq!(e.cursor.0, 9);
+    }
+
+    #[test]
+    fn move_page_down_clamps_column_to_line_width() {
+        // 移動先の行幅が短い場合、列がクランプされる
+        let mut e = editor_with("aaaaaa\nbb");
+        e.cursor = (0, 5);
+        e.move_page_down(1);
+        assert_eq!(e.cursor.0, 1);
+        assert_eq!(e.cursor.1, 2); // "bb" は 2 文字
+    }
+
+    #[test]
+    fn move_page_down_at_last_line_keeps_position() {
+        let mut e = editor_with_lines(5);
+        e.cursor = (4, 0);
+        e.move_page_down(20);
+        assert_eq!(e.cursor.0, 4);
+    }
+
+    #[test]
+    fn move_page_down_with_page_size_zero_no_move() {
+        let mut e = editor_with_lines(10);
+        e.cursor = (3, 0);
+        e.move_page_down(0);
+        assert_eq!(e.cursor.0, 3);
+    }
+
+    // ── move_page_up ──
+
+    #[test]
+    fn move_page_up_retreats_cursor_by_page_size() {
+        let mut e = editor_with_lines(50);
+        e.cursor = (30, 0);
+        e.move_page_up(20);
+        assert_eq!(e.cursor.0, 10);
+        assert_eq!(e.cursor.1, 0);
+    }
+
+    #[test]
+    fn move_page_up_clamps_at_top() {
+        let mut e = editor_with_lines(10);
+        e.cursor = (5, 0);
+        e.move_page_up(20);
+        assert_eq!(e.cursor.0, 0);
+    }
+
+    #[test]
+    fn move_page_up_clamps_column_to_line_width() {
+        let mut e = editor_with("a\nbbbbbb");
+        e.cursor = (1, 6);
+        e.move_page_up(1);
+        assert_eq!(e.cursor.0, 0);
+        assert_eq!(e.cursor.1, 1); // "a" は 1 文字
+    }
+
+    #[test]
+    fn move_page_up_at_first_line_keeps_position() {
+        let mut e = editor_with_lines(5);
+        e.cursor = (0, 0);
+        e.move_page_up(20);
+        assert_eq!(e.cursor.0, 0);
+    }
+
+    // ── move_h_page_left ──
+
+    #[test]
+    fn move_h_page_left_retreats_column_by_40() {
+        let line: String = "x".repeat(100);
+        let mut e = editor_with(&line);
+        e.cursor = (0, 80);
+        e.move_h_page_left();
+        assert_eq!(e.cursor.1, 40);
+    }
+
+    #[test]
+    fn move_h_page_left_clamps_at_zero() {
+        let line: String = "x".repeat(100);
+        let mut e = editor_with(&line);
+        e.cursor = (0, 30);
+        e.move_h_page_left();
+        assert_eq!(e.cursor.1, 0);
+    }
+
+    #[test]
+    fn move_h_page_left_at_zero_keeps_zero() {
+        let mut e = editor_with("hello");
+        e.cursor = (0, 0);
+        e.move_h_page_left();
+        assert_eq!(e.cursor.1, 0);
+    }
+
+    // ── move_h_page_right ──
+
+    #[test]
+    fn move_h_page_right_advances_column_by_40() {
+        let line: String = "x".repeat(100);
+        let mut e = editor_with(&line);
+        e.cursor = (0, 10);
+        e.move_h_page_right();
+        assert_eq!(e.cursor.1, 50);
+    }
+
+    #[test]
+    fn move_h_page_right_clamps_to_line_end() {
+        let line: String = "x".repeat(20);
+        let mut e = editor_with(&line);
+        e.cursor = (0, 0);
+        e.move_h_page_right();
+        assert_eq!(e.cursor.1, 20); // 行幅でクランプ
+    }
+
+    #[test]
+    fn move_h_page_right_at_line_end_keeps_position() {
+        let mut e = editor_with("hello");
+        e.cursor = (0, 5);
+        e.move_h_page_right();
+        assert_eq!(e.cursor.1, 5);
+    }
+
+    // ── Scrollable for EditorState ──
+
+    use crate::tui::scrollable::Scrollable as ScrollableTrait;
+
+    #[test]
+    fn scrollable_editor_move_one_down_advances_row() {
+        let mut e = editor_with_lines(5);
+        e.cursor = (1, 0);
+        ScrollableTrait::move_one_down(&mut e);
+        assert_eq!(e.cursor, (2, 0));
+    }
+
+    #[test]
+    fn scrollable_editor_move_one_up_retreats_row() {
+        let mut e = editor_with_lines(5);
+        e.cursor = (3, 0);
+        ScrollableTrait::move_one_up(&mut e);
+        assert_eq!(e.cursor, (2, 0));
+    }
+
+    #[test]
+    fn scrollable_editor_move_one_left_retreats_column() {
+        let mut e = editor_with("abcde");
+        e.cursor = (0, 3);
+        ScrollableTrait::move_one_left(&mut e);
+        assert_eq!(e.cursor, (0, 2));
+    }
+
+    #[test]
+    fn scrollable_editor_move_one_right_advances_column() {
+        let mut e = editor_with("abcde");
+        e.cursor = (0, 1);
+        ScrollableTrait::move_one_right(&mut e);
+        assert_eq!(e.cursor, (0, 2));
+    }
+
+    #[test]
+    fn scrollable_editor_scroll_to_top_jumps_to_zero_zero() {
+        let mut e = editor_with_lines(10);
+        e.cursor = (5, 3);
+        ScrollableTrait::scroll_to_top(&mut e);
+        assert_eq!(e.cursor, (0, 0));
+    }
+
+    #[test]
+    fn scrollable_editor_scroll_to_bottom_jumps_to_last_row_col_zero() {
+        let mut e = editor_with_lines(10);
+        e.cursor = (0, 0);
+        ScrollableTrait::scroll_to_bottom(&mut e);
+        assert_eq!(e.cursor, (9, 0));
+    }
+
+    #[test]
+    fn scrollable_editor_h_scroll_home_zeros_column() {
+        let mut e = editor_with("hello world");
+        e.cursor = (0, 7);
+        ScrollableTrait::h_scroll_home(&mut e);
+        assert_eq!(e.cursor.1, 0);
+    }
+
+    #[test]
+    fn scrollable_editor_h_scroll_end_jumps_to_line_end() {
+        let mut e = editor_with("hello");
+        e.cursor = (0, 0);
+        ScrollableTrait::h_scroll_end(&mut e);
+        assert_eq!(e.cursor.1, 5);
+    }
+
+    #[test]
+    fn scrollable_editor_page_down_delegates_to_move_page_down() {
+        let mut e = editor_with_lines(50);
+        e.cursor = (0, 0);
+        ScrollableTrait::page_down(&mut e, 20);
+        assert_eq!(e.cursor.0, 20);
+    }
+
+    #[test]
+    fn scrollable_editor_page_up_delegates_to_move_page_up() {
+        let mut e = editor_with_lines(50);
+        e.cursor = (30, 0);
+        ScrollableTrait::page_up(&mut e, 20);
+        assert_eq!(e.cursor.0, 10);
+    }
+
+    #[test]
+    fn scrollable_editor_h_page_left_retreats_40() {
+        let line: String = "x".repeat(100);
+        let mut e = editor_with(&line);
+        e.cursor = (0, 80);
+        ScrollableTrait::h_page_left(&mut e);
+        assert_eq!(e.cursor.1, 40);
+    }
+
+    #[test]
+    fn scrollable_editor_h_page_right_advances_40() {
+        let line: String = "x".repeat(100);
+        let mut e = editor_with(&line);
+        e.cursor = (0, 10);
+        ScrollableTrait::h_page_right(&mut e);
+        assert_eq!(e.cursor.1, 50);
     }
 }

@@ -1,5 +1,6 @@
 use crate::db::adapter::QueryResult;
 use crate::tui::cc_edit::CcEligibility;
+use crate::tui::scrollable::Scrollable;
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -172,6 +173,56 @@ impl ResultsState {
     }
 }
 
+impl Scrollable for ResultsState {
+    fn move_one_down(&mut self) {
+        self.scroll_down();
+    }
+
+    fn move_one_up(&mut self) {
+        self.scroll_up();
+    }
+
+    fn move_one_left(&mut self) {
+        self.scroll_left(4);
+    }
+
+    fn move_one_right(&mut self) {
+        self.scroll_right(4);
+    }
+
+    fn scroll_to_top(&mut self) {
+        ResultsState::scroll_to_top(self);
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        ResultsState::scroll_to_bottom(self);
+    }
+
+    fn h_scroll_home(&mut self) {
+        ResultsState::h_scroll_home(self);
+    }
+
+    fn h_scroll_end(&mut self) {
+        ResultsState::h_scroll_end(self);
+    }
+
+    fn page_down(&mut self, page_size: usize) {
+        ResultsState::page_down(self, page_size);
+    }
+
+    fn page_up(&mut self, page_size: usize) {
+        ResultsState::page_up(self, page_size);
+    }
+
+    fn h_page_left(&mut self) {
+        ResultsState::h_page_left(self);
+    }
+
+    fn h_page_right(&mut self) {
+        ResultsState::h_page_right(self);
+    }
+}
+
 // ── 描画 ──
 
 pub fn render(f: &mut Frame, results: &ResultsState, is_focused: bool, area: Rect) {
@@ -330,5 +381,194 @@ fn pad_right(s: &str, width: usize) -> String {
         s.to_string()
     } else {
         format!("{}{}", s, " ".repeat(width - w))
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn results_with(rows: usize, cols: usize) -> ResultsState {
+        let mut r = ResultsState::new();
+        r.columns = (0..cols).map(|i| format!("c{}", i)).collect();
+        r.rows = (0..rows)
+            .map(|i| (0..cols).map(|j| format!("r{}_{}", i, j)).collect())
+            .collect();
+        r.col_widths = vec![10; cols];
+        r.status = ResultStatus::Success;
+        r.total_rows = rows;
+        r.visible_width = 30;
+        r
+    }
+
+    // ── move_one_down / move_one_up ──
+
+    #[test]
+    fn scrollable_results_move_one_down_advances_offset() {
+        let mut r = results_with(10, 2);
+        r.scroll_offset = 0;
+        r.move_one_down();
+        assert_eq!(r.scroll_offset, 1);
+    }
+
+    #[test]
+    fn scrollable_results_move_one_down_clamps_at_last_row() {
+        let mut r = results_with(5, 2);
+        r.scroll_offset = 4;
+        r.move_one_down();
+        // 既存 scroll_down は scroll_offset + 1 < rows.len() のときだけ進む
+        assert_eq!(r.scroll_offset, 4);
+    }
+
+    #[test]
+    fn scrollable_results_move_one_up_retreats_offset() {
+        let mut r = results_with(10, 2);
+        r.scroll_offset = 5;
+        r.move_one_up();
+        assert_eq!(r.scroll_offset, 4);
+    }
+
+    #[test]
+    fn scrollable_results_move_one_up_clamps_at_zero() {
+        let mut r = results_with(10, 2);
+        r.scroll_offset = 0;
+        r.move_one_up();
+        assert_eq!(r.scroll_offset, 0);
+    }
+
+    // ── move_one_left / move_one_right (4 セル単位) ──
+
+    #[test]
+    fn scrollable_results_move_one_right_advances_h_scroll_by_4() {
+        let mut r = results_with(10, 5);
+        // total_content_width >> visible_width になるように col_widths を膨らませる
+        r.col_widths = vec![50; 5];
+        r.visible_width = 10;
+        r.h_scroll = 0;
+        r.move_one_right();
+        assert_eq!(r.h_scroll, 4);
+    }
+
+    #[test]
+    fn scrollable_results_move_one_left_retreats_h_scroll_by_4() {
+        let mut r = results_with(10, 5);
+        r.h_scroll = 10;
+        r.move_one_left();
+        assert_eq!(r.h_scroll, 6);
+    }
+
+    #[test]
+    fn scrollable_results_move_one_left_clamps_at_zero() {
+        let mut r = results_with(10, 5);
+        r.h_scroll = 2;
+        r.move_one_left();
+        assert_eq!(r.h_scroll, 0);
+    }
+
+    // ── scroll_to_top / scroll_to_bottom ──
+
+    #[test]
+    fn scrollable_results_scroll_to_top_zeros_offset() {
+        let mut r = results_with(10, 2);
+        r.scroll_offset = 5;
+        Scrollable::scroll_to_top(&mut r);
+        assert_eq!(r.scroll_offset, 0);
+    }
+
+    #[test]
+    fn scrollable_results_scroll_to_bottom_lands_on_last() {
+        let mut r = results_with(10, 2);
+        r.scroll_offset = 0;
+        Scrollable::scroll_to_bottom(&mut r);
+        assert_eq!(r.scroll_offset, 9);
+    }
+
+    #[test]
+    fn scrollable_results_scroll_to_bottom_with_no_rows_is_zero() {
+        let mut r = ResultsState::new();
+        r.scroll_offset = 0;
+        Scrollable::scroll_to_bottom(&mut r);
+        assert_eq!(r.scroll_offset, 0);
+    }
+
+    // ── h_scroll_home / h_scroll_end ──
+
+    #[test]
+    fn scrollable_results_h_scroll_home_zeros_h_scroll() {
+        let mut r = results_with(10, 5);
+        r.h_scroll = 50;
+        Scrollable::h_scroll_home(&mut r);
+        assert_eq!(r.h_scroll, 0);
+    }
+
+    #[test]
+    fn scrollable_results_h_scroll_end_lands_at_max() {
+        let mut r = results_with(10, 3);
+        r.col_widths = vec![20; 3]; // total = 20*3 + 3*2 + 2 = 68
+        r.visible_width = 10;
+        Scrollable::h_scroll_end(&mut r);
+        // total_content_width(68) - visible_width(10) = 58
+        assert_eq!(r.h_scroll, 58);
+    }
+
+    // ── page_down / page_up ──
+
+    #[test]
+    fn scrollable_results_page_down_advances_by_page_size() {
+        let mut r = results_with(50, 2);
+        r.scroll_offset = 0;
+        Scrollable::page_down(&mut r, 20);
+        assert_eq!(r.scroll_offset, 20);
+    }
+
+    #[test]
+    fn scrollable_results_page_down_clamps_at_last_row() {
+        let mut r = results_with(10, 2);
+        r.scroll_offset = 5;
+        Scrollable::page_down(&mut r, 20);
+        assert_eq!(r.scroll_offset, 9);
+    }
+
+    #[test]
+    fn scrollable_results_page_up_retreats_by_page_size() {
+        let mut r = results_with(50, 2);
+        r.scroll_offset = 30;
+        Scrollable::page_up(&mut r, 20);
+        assert_eq!(r.scroll_offset, 10);
+    }
+
+    #[test]
+    fn scrollable_results_page_up_clamps_at_zero() {
+        let mut r = results_with(10, 2);
+        r.scroll_offset = 5;
+        Scrollable::page_up(&mut r, 20);
+        assert_eq!(r.scroll_offset, 0);
+    }
+
+    // ── h_page_left / h_page_right ──
+
+    #[test]
+    fn scrollable_results_h_page_right_advances_h_scroll_by_40() {
+        let mut r = results_with(10, 5);
+        r.col_widths = vec![50; 5]; // total >>>
+        r.visible_width = 10;
+        r.h_scroll = 0;
+        Scrollable::h_page_right(&mut r);
+        assert_eq!(r.h_scroll, 40);
+    }
+
+    #[test]
+    fn scrollable_results_h_page_left_retreats_h_scroll_by_40() {
+        let mut r = results_with(10, 5);
+        r.h_scroll = 100;
+        Scrollable::h_page_left(&mut r);
+        assert_eq!(r.h_scroll, 60);
+    }
+
+    #[test]
+    fn scrollable_results_h_page_left_clamps_at_zero() {
+        let mut r = results_with(10, 5);
+        r.h_scroll = 20;
+        Scrollable::h_page_left(&mut r);
+        assert_eq!(r.h_scroll, 0);
     }
 }

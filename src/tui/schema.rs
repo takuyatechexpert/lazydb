@@ -1,5 +1,6 @@
 use std::cell::Cell;
 
+use crate::tui::scrollable::Scrollable;
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -184,6 +185,60 @@ pub enum ToggleResult {
     NeedFetchColumns(String),
 }
 
+impl Scrollable for SchemaState {
+    fn move_one_down(&mut self) {
+        self.move_down();
+    }
+
+    fn move_one_up(&mut self) {
+        self.move_up();
+    }
+
+    fn move_one_left(&mut self) {
+        // Schema は横スクロール状態を持たないため no-op
+    }
+
+    fn move_one_right(&mut self) {
+        // Schema は横スクロール状態を持たないため no-op
+    }
+
+    fn scroll_to_top(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        self.cursor = self.flat_items().len().saturating_sub(1);
+    }
+
+    fn h_scroll_home(&mut self) {
+        // no-op
+    }
+
+    fn h_scroll_end(&mut self) {
+        // no-op
+    }
+
+    fn page_down(&mut self, page_size: usize) {
+        let len = self.flat_items().len();
+        if len == 0 {
+            return;
+        }
+        self.cursor = (self.cursor + page_size).min(len - 1);
+    }
+
+    fn page_up(&mut self, page_size: usize) {
+        self.cursor = self.cursor.saturating_sub(page_size);
+    }
+
+    fn h_page_left(&mut self) {
+        // no-op
+    }
+
+    fn h_page_right(&mut self) {
+        // no-op
+    }
+}
+
 // ── 描画 ──
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸"];
@@ -299,4 +354,215 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let visible: Vec<ListItem> = list_items.into_iter().skip(offset).collect();
     let list = List::new(visible).block(block);
     f.render_widget(list, area);
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schema_with(table_specs: &[(&str, bool, &[&str])]) -> SchemaState {
+        // (table_name, expanded, columns)
+        let mut s = SchemaState::new();
+        for (name, expanded, cols) in table_specs {
+            s.tables.push(TableEntry {
+                name: (*name).to_string(),
+                expanded: *expanded,
+                columns_loaded: !cols.is_empty(),
+                columns_loading: false,
+                columns: cols
+                    .iter()
+                    .map(|c| ColumnEntry {
+                        name: (*c).to_string(),
+                        col_type: "text".to_string(),
+                        is_primary_key: false,
+                    })
+                    .collect(),
+            });
+        }
+        s
+    }
+
+    fn schema_with_n_tables(n: usize) -> SchemaState {
+        let mut s = SchemaState::new();
+        for i in 0..n {
+            s.tables.push(TableEntry {
+                name: format!("t{}", i),
+                expanded: false,
+                columns_loaded: false,
+                columns_loading: false,
+                columns: Vec::new(),
+            });
+        }
+        s
+    }
+
+    // ── move_one_down / move_one_up ──
+
+    #[test]
+    fn scrollable_schema_move_one_down_advances_cursor() {
+        let mut s = schema_with_n_tables(5);
+        s.cursor = 1;
+        s.move_one_down();
+        assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn scrollable_schema_move_one_down_clamps_at_last() {
+        let mut s = schema_with_n_tables(3);
+        s.cursor = 2;
+        s.move_one_down();
+        assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn scrollable_schema_move_one_up_retreats_cursor() {
+        let mut s = schema_with_n_tables(5);
+        s.cursor = 3;
+        s.move_one_up();
+        assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn scrollable_schema_move_one_up_clamps_at_zero() {
+        let mut s = schema_with_n_tables(3);
+        s.cursor = 0;
+        s.move_one_up();
+        assert_eq!(s.cursor, 0);
+    }
+
+    // ── 横操作は no-op ──
+
+    #[test]
+    fn scrollable_schema_move_one_left_is_noop() {
+        let mut s = schema_with_n_tables(5);
+        s.cursor = 2;
+        s.move_one_left();
+        assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn scrollable_schema_move_one_right_is_noop() {
+        let mut s = schema_with_n_tables(5);
+        s.cursor = 2;
+        s.move_one_right();
+        assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn scrollable_schema_h_scroll_home_is_noop() {
+        let mut s = schema_with_n_tables(5);
+        s.cursor = 3;
+        s.h_scroll_home();
+        assert_eq!(s.cursor, 3);
+    }
+
+    #[test]
+    fn scrollable_schema_h_scroll_end_is_noop() {
+        let mut s = schema_with_n_tables(5);
+        s.cursor = 3;
+        s.h_scroll_end();
+        assert_eq!(s.cursor, 3);
+    }
+
+    #[test]
+    fn scrollable_schema_h_page_left_is_noop() {
+        let mut s = schema_with_n_tables(5);
+        s.cursor = 3;
+        s.h_page_left();
+        assert_eq!(s.cursor, 3);
+    }
+
+    #[test]
+    fn scrollable_schema_h_page_right_is_noop() {
+        let mut s = schema_with_n_tables(5);
+        s.cursor = 3;
+        s.h_page_right();
+        assert_eq!(s.cursor, 3);
+    }
+
+    // ── scroll_to_top / scroll_to_bottom ──
+
+    #[test]
+    fn scrollable_schema_scroll_to_top_zeros_cursor() {
+        let mut s = schema_with_n_tables(5);
+        s.cursor = 4;
+        s.scroll_to_top();
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn scrollable_schema_scroll_to_bottom_lands_on_last_item() {
+        let mut s = schema_with_n_tables(5);
+        s.cursor = 0;
+        s.scroll_to_bottom();
+        assert_eq!(s.cursor, 4); // 0..=4 の末尾
+    }
+
+    #[test]
+    fn scrollable_schema_scroll_to_bottom_with_expanded_table_uses_flat_len() {
+        // テーブルが expanded=true でカラムも flat_items に含まれる
+        let mut s = schema_with(&[("t1", true, &["c1", "c2", "c3"]), ("t2", false, &[])]);
+        // flat_items: [t1, c1, c2, c3, t2] = 5 件
+        assert_eq!(s.flat_items().len(), 5);
+        s.cursor = 0;
+        s.scroll_to_bottom();
+        assert_eq!(s.cursor, 4);
+    }
+
+    #[test]
+    fn scrollable_schema_scroll_to_bottom_with_no_items_clamps_to_zero() {
+        let mut s = SchemaState::new();
+        s.scroll_to_bottom();
+        // saturating_sub(1) で 0
+        assert_eq!(s.cursor, 0);
+    }
+
+    // ── page_down / page_up ──
+
+    #[test]
+    fn scrollable_schema_page_down_advances_by_page_size() {
+        let mut s = schema_with_n_tables(50);
+        s.cursor = 0;
+        s.page_down(20);
+        assert_eq!(s.cursor, 20);
+    }
+
+    #[test]
+    fn scrollable_schema_page_down_clamps_at_last() {
+        let mut s = schema_with_n_tables(10);
+        s.cursor = 5;
+        s.page_down(20);
+        assert_eq!(s.cursor, 9);
+    }
+
+    #[test]
+    fn scrollable_schema_page_down_with_empty_items_does_nothing() {
+        let mut s = SchemaState::new();
+        s.cursor = 0;
+        s.page_down(20);
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn scrollable_schema_page_up_retreats_by_page_size() {
+        let mut s = schema_with_n_tables(50);
+        s.cursor = 30;
+        s.page_up(20);
+        assert_eq!(s.cursor, 10);
+    }
+
+    #[test]
+    fn scrollable_schema_page_up_clamps_at_zero() {
+        let mut s = schema_with_n_tables(10);
+        s.cursor = 5;
+        s.page_up(20);
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn scrollable_schema_page_up_with_empty_items_keeps_zero() {
+        let mut s = SchemaState::new();
+        s.cursor = 0;
+        s.page_up(20);
+        assert_eq!(s.cursor, 0);
+    }
 }
