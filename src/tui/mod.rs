@@ -910,6 +910,14 @@ impl App {
             KeyCode::Char('D') => self.tabs[idx].editor.delete_to_end(),
             KeyCode::Char('C') => self.tabs[idx].editor.change_to_end(),
             KeyCode::Char('u') => self.tabs[idx].editor.undo(),
+            // バッファ全体をフォーマット
+            KeyCode::Char('=') => {
+                if self.tabs[idx].editor.format_buffer() {
+                    self.status_message = Some("クエリをフォーマットしました".to_string());
+                } else {
+                    self.status_message = Some("フォーマット対象がありません".to_string());
+                }
+            }
             _ => {}
         }
     }
@@ -1850,7 +1858,14 @@ pub async fn run(connections: Vec<ConnectionConfig>, config: AppConfig, initial_
         let term_width = term_size.width as usize;
         let editor_height = (term_height.saturating_sub(2) * 65 / 100).saturating_sub(2);
         let idx = app.active_tab;
-        app.tabs[idx].editor.adjust_scroll(editor_height);
+        // Editor の可視幅を計算: 右70% - 外枠2 - 行番号桁 - 区切り1
+        let line_num_width = format!("{}", app.tabs[idx].editor.lines.len()).len().max(2);
+        let editor_inner_width = (term_width * 70 / 100)
+            .saturating_sub(2)
+            .saturating_sub(line_num_width + 1);
+        app.tabs[idx]
+            .editor
+            .adjust_scroll(editor_height, editor_inner_width);
         // Results パネルの表示幅を更新（右70% - ボーダー2）
         app.tabs[idx].results.visible_width = (term_width * 70 / 100).saturating_sub(2);
 

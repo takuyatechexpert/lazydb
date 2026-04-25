@@ -57,6 +57,7 @@ pub fn render(f: &mut Frame, area: Rect) {
         help_line("gg/G", "先頭/末尾"),
         help_line("x/dd/D/C", "削除"),
         help_line("u/Ctrl+R", "undo/redo"),
+        help_line("=", "クエリ全体をフォーマット"),
         Line::raw(""),
         Line::from(Span::styled(
             "Editor Insert",

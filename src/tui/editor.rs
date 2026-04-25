@@ -89,6 +89,8 @@ pub struct EditorState {
     /// (行, 列)
     pub cursor: (usize, usize),
     pub scroll_offset: usize,
+    /// 横スクロール（カーソル列が画面幅を超えた場合のオフセット）
+    pub h_scroll_offset: usize,
     pub mode: EditorMode,
     /// gg コマンド用: 直前に g が押されたか
     pub pending_g: bool,
@@ -106,6 +108,7 @@ impl EditorState {
             lines: vec![String::new()],
             cursor: (0, 0),
             scroll_offset: 0,
+            h_scroll_offset: 0,
             mode: EditorMode::Normal,
             pending_g: false,
             undo_stack: Vec::new(),
@@ -728,15 +731,58 @@ impl EditorState {
         }
     }
 
-    /// スクロールオフセットを調整してカーソルを表示範囲内に保つ
-    pub fn adjust_scroll(&mut self, visible_height: usize) {
-        if visible_height == 0 {
-            return;
+    /// バッファ全体を SQL フォーマッタで整形する。
+    /// 中身が空、または整形結果が変わらない場合は何もしない。
+    pub fn format_buffer(&mut self) -> bool {
+        let original = self.lines.join("\n");
+        if original.trim().is_empty() {
+            return false;
         }
-        if self.cursor.0 < self.scroll_offset {
-            self.scroll_offset = self.cursor.0;
-        } else if self.cursor.0 >= self.scroll_offset + visible_height {
-            self.scroll_offset = self.cursor.0 - visible_height + 1;
+        let opts = sqlformat::FormatOptions {
+            indent: sqlformat::Indent::Spaces(2),
+            uppercase: Some(true),
+            ..sqlformat::FormatOptions::default()
+        };
+        let formatted = sqlformat::format(&original, &sqlformat::QueryParams::None, &opts);
+        if formatted == original {
+            return false;
+        }
+        self.save_snapshot();
+        self.lines = formatted.lines().map(String::from).collect();
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        // カーソルを安全な位置にクランプ
+        if self.cursor.0 >= self.lines.len() {
+            self.cursor.0 = self.lines.len() - 1;
+        }
+        let line_chars = char_count(&self.lines[self.cursor.0]);
+        if self.cursor.1 > line_chars {
+            self.cursor.1 = line_chars;
+        }
+        self.h_scroll_offset = 0;
+        true
+    }
+
+    /// スクロールオフセットを調整してカーソルを表示範囲内に保つ
+    pub fn adjust_scroll(&mut self, visible_height: usize, visible_width: usize) {
+        // 縦スクロール
+        if visible_height > 0 {
+            if self.cursor.0 < self.scroll_offset {
+                self.scroll_offset = self.cursor.0;
+            } else if self.cursor.0 >= self.scroll_offset + visible_height {
+                self.scroll_offset = self.cursor.0 - visible_height + 1;
+            }
+        }
+        // 横スクロール
+        if visible_width > 0 {
+            if self.cursor.1 < self.h_scroll_offset {
+                self.h_scroll_offset = self.cursor.1;
+            } else if self.cursor.1 >= self.h_scroll_offset + visible_width {
+                self.h_scroll_offset = self.cursor.1 + 1 - visible_width;
+            }
+        } else {
+            self.h_scroll_offset = 0;
         }
     }
 }
@@ -782,7 +828,7 @@ pub fn render(f: &mut Frame, editor: &EditorState, is_focused: bool, area: Rect)
     }
 
     let line_num_width = format!("{}", editor.lines.len()).len().max(2);
-    let _editor_width = inner.width as usize - line_num_width - 2; // 2 for "│ "
+    let editor_width = (inner.width as usize).saturating_sub(line_num_width + 1); // 1 for "│"
 
     let visible_height = inner.height as usize;
 
@@ -790,24 +836,27 @@ pub fn render(f: &mut Frame, editor: &EditorState, is_focused: bool, area: Rect)
     let start = editor.scroll_offset;
     let end = (start + visible_height).min(editor.lines.len());
 
-    let mut display_lines: Vec<Line> = Vec::new();
+    let mut display_lines: Vec<Line<'static>> = Vec::new();
 
     for i in start..end {
         let line = &editor.lines[i];
         let line_num = format!("{:>width$}", i + 1, width = line_num_width);
 
-        let mut spans = vec![
+        let mut spans: Vec<Span<'static>> = vec![
             Span::styled(line_num, Style::default().fg(Color::DarkGray)),
-            Span::styled("│", Style::default().fg(Color::DarkGray)),
+            Span::styled("│".to_string(), Style::default().fg(Color::DarkGray)),
         ];
 
-        // シンタックスハイライト
-        spans.extend(highlight_sql(line));
+        // h_scroll を考慮した可視部分
+        let visible_str: String = line
+            .chars()
+            .skip(editor.h_scroll_offset)
+            .take(editor_width)
+            .collect();
 
-        // カーソル表示（フォーカス時のみ）
-        if is_focused && i == editor.cursor.0 {
-            // カーソル位置のハイライトは ratatui では直接できないので
-            // set_cursor で対応
+        // シンタックスハイライト（owned Span に変換）
+        for s in highlight_sql(&visible_str) {
+            spans.push(Span::styled(s.content.into_owned(), s.style));
         }
 
         display_lines.push(Line::from(spans));
@@ -818,8 +867,8 @@ pub fn render(f: &mut Frame, editor: &EditorState, is_focused: bool, area: Rect)
         let line_num = " ".repeat(line_num_width);
         display_lines.push(Line::from(vec![
             Span::styled(line_num, Style::default().fg(Color::DarkGray)),
-            Span::styled("│", Style::default().fg(Color::DarkGray)),
-            Span::styled("~", Style::default().fg(Color::DarkGray)),
+            Span::styled("│".to_string(), Style::default().fg(Color::DarkGray)),
+            Span::styled("~".to_string(), Style::default().fg(Color::DarkGray)),
         ]));
     }
 
@@ -827,18 +876,28 @@ pub fn render(f: &mut Frame, editor: &EditorState, is_focused: bool, area: Rect)
     f.render_widget(paragraph, inner);
 
     // カーソル表示（Normal / Insert 両モード）
-    if is_focused {
-        let cursor_x = inner.x + line_num_width as u16 + 1 + editor.cursor.1 as u16;
-        let cursor_y = inner.y + (editor.cursor.0 - editor.scroll_offset) as u16;
+    if is_focused && editor.cursor.1 >= editor.h_scroll_offset {
+        let cursor_x = inner.x
+            + line_num_width as u16
+            + 1
+            + (editor.cursor.1 - editor.h_scroll_offset) as u16;
+        let cursor_y = inner.y + editor.cursor.0.saturating_sub(editor.scroll_offset) as u16;
         if cursor_x < inner.x + inner.width && cursor_y < inner.y + inner.height {
             f.set_cursor_position((cursor_x, cursor_y));
         }
     }
 
     // オートコンプリート プルダウン
-    if is_focused && editor.completion.active && !editor.completion.candidates.is_empty() {
-        let cursor_x = inner.x + line_num_width as u16 + 1 + editor.cursor.1 as u16;
-        let cursor_y = inner.y + (editor.cursor.0 - editor.scroll_offset) as u16;
+    if is_focused
+        && editor.completion.active
+        && !editor.completion.candidates.is_empty()
+        && editor.cursor.1 >= editor.h_scroll_offset
+    {
+        let cursor_x = inner.x
+            + line_num_width as u16
+            + 1
+            + (editor.cursor.1 - editor.h_scroll_offset) as u16;
+        let cursor_y = inner.y + editor.cursor.0.saturating_sub(editor.scroll_offset) as u16;
 
         let max_items = editor.completion.candidates.len().min(8);
         let popup_width = editor
@@ -1290,5 +1349,64 @@ mod tests {
         e.cursor = (0, 8);
         e.move_first_non_blank();
         assert_eq!(e.cursor, (0, 2));
+    }
+
+    // ── format_buffer ──
+
+    #[test]
+    fn format_buffer_uppercases_and_indents() {
+        let mut e = editor_with("select id,name from users where id=1");
+        let changed = e.format_buffer();
+        assert!(changed);
+        // SELECT 等のキーワードが大文字化されていること
+        assert!(e.lines.iter().any(|l| l.contains("SELECT")));
+        assert!(e.lines.iter().any(|l| l.contains("FROM")));
+        assert!(e.lines.iter().any(|l| l.contains("WHERE")));
+    }
+
+    #[test]
+    fn format_buffer_empty_returns_false() {
+        let mut e = EditorState::new();
+        assert!(!e.format_buffer());
+    }
+
+    #[test]
+    fn format_buffer_undoable() {
+        let original = "select 1";
+        let mut e = editor_with(original);
+        assert!(e.format_buffer());
+        // 結果が変化していること
+        assert_ne!(e.lines.join("\n"), original);
+        e.undo();
+        assert_eq!(e.lines, vec![original.to_string()]);
+    }
+
+    // ── adjust_scroll (horizontal) ──
+
+    #[test]
+    fn adjust_scroll_horizontal_when_cursor_exceeds_width() {
+        let mut e = editor_with("ABCDEFGHIJ");
+        e.cursor = (0, 10);
+        e.adjust_scroll(10, 5); // visible_width = 5
+        // cursor.1 (10) >= h_scroll_offset (0) + 5 → h_scroll_offset = 10 + 1 - 5 = 6
+        assert_eq!(e.h_scroll_offset, 6);
+    }
+
+    #[test]
+    fn adjust_scroll_horizontal_when_cursor_before_offset() {
+        let mut e = editor_with("ABCDEFGHIJ");
+        e.h_scroll_offset = 5;
+        e.cursor = (0, 2);
+        e.adjust_scroll(10, 5);
+        // cursor.1 (2) < h_scroll_offset (5) → h_scroll_offset = 2
+        assert_eq!(e.h_scroll_offset, 2);
+    }
+
+    #[test]
+    fn adjust_scroll_horizontal_no_change_when_within_view() {
+        let mut e = editor_with("ABCDEFGHIJ");
+        e.cursor = (0, 3);
+        e.adjust_scroll(10, 10);
+        assert_eq!(e.h_scroll_offset, 0);
     }
 }
