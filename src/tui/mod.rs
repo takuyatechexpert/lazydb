@@ -507,8 +507,7 @@ impl App {
                             let eligibility = cc_edit::compute_eligibility(&analysis, &self.schema);
                             tab.results.set_cc_eligibility(eligibility.clone());
                             if matches!(eligibility, CcEligibility::ColumnsNotLoaded) {
-                                if let Some(ref table) = analysis.table {
-                                    let table = table.clone();
+                                if let Some(table) = analysis.table.clone() {
                                     self.maybe_auto_fetch_columns(&table);
                                 }
                             }

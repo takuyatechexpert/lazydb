@@ -458,10 +458,15 @@ mod tests {
 
     // ── ヘルパー ──
 
+    /// テスト用 SchemaState を組み立てるヘルパー
+    /// - `columns`: (name, col_type, is_pk) のリスト
+    /// - `columns_loaded`: カラム読込済フラグ
+    /// - `columns_loading`: カラム読込中フラグ
     fn make_schema_with_table(
         table_name: &str,
         columns: Vec<(&str, &str, bool)>,
-        loaded: bool,
+        columns_loaded: bool,
+        columns_loading: bool,
     ) -> SchemaState {
         let mut schema = SchemaState::new();
         let col_entries: Vec<ColumnEntry> = columns
@@ -476,8 +481,8 @@ mod tests {
             name: table_name.to_string(),
             expanded: false,
             columns: col_entries,
-            columns_loaded: loaded,
-            columns_loading: false,
+            columns_loaded,
+            columns_loading,
         });
         schema
     }
@@ -716,6 +721,7 @@ mod tests {
             "users",
             vec![("id", "int", true), ("name", "varchar", false)],
             true,
+            false,
         );
         let analysis = CcAnalysis::from_query("SELECT * FROM users");
         let result = compute_eligibility(&analysis, &schema);
@@ -765,7 +771,7 @@ mod tests {
     /// 関数呼び出し等の式カラムを含む SELECT → HasExpression
     #[test]
     fn eligibility_has_expression() {
-        let schema = make_schema_with_table("users", vec![("id", "int", true)], true);
+        let schema = make_schema_with_table("users", vec![("id", "int", true)], true, false);
         let analysis = CcAnalysis::from_query("SELECT COUNT(*) FROM users");
         let result = compute_eligibility(&analysis, &schema);
         assert_eq!(result, CcEligibility::HasExpression);
@@ -774,7 +780,7 @@ mod tests {
     /// スキーマが未読込（columns_loaded=false）→ ColumnsNotLoaded
     #[test]
     fn eligibility_columns_not_loaded() {
-        let schema = make_schema_with_table("users", vec![("id", "int", true)], false);
+        let schema = make_schema_with_table("users", vec![("id", "int", true)], false, false);
         let analysis = CcAnalysis::from_query("SELECT * FROM users");
         let result = compute_eligibility(&analysis, &schema);
         assert_eq!(result, CcEligibility::ColumnsNotLoaded);
@@ -796,6 +802,7 @@ mod tests {
             "users",
             vec![("id", "int", false), ("name", "varchar", false)],
             true,
+            false,
         );
         let analysis = CcAnalysis::from_query("SELECT * FROM users");
         let result = compute_eligibility(&analysis, &schema);
@@ -930,37 +937,12 @@ mod tests {
     }
 
     // ── 自動カラムフェッチに伴う compute_eligibility の状態遷移 ──
-    // ヘルパー: columns_loading を指定可能な拡張版
-    fn make_schema_with_loading(
-        table_name: &str,
-        columns: Vec<(&str, &str, bool)>,
-        loaded: bool,
-        loading: bool,
-    ) -> SchemaState {
-        let mut schema = SchemaState::new();
-        let col_entries: Vec<ColumnEntry> = columns
-            .into_iter()
-            .map(|(n, t, pk)| ColumnEntry {
-                name: n.to_string(),
-                col_type: t.to_string(),
-                is_primary_key: pk,
-            })
-            .collect();
-        schema.tables.push(TableEntry {
-            name: table_name.to_string(),
-            expanded: false,
-            columns: col_entries,
-            columns_loaded: loaded,
-            columns_loading: loading,
-        });
-        schema
-    }
 
     /// ケース A: schema に該当テーブルあり + columns_loaded=false → ColumnsNotLoaded
     /// （自動フェッチをトリガーすべき状態）
     #[test]
     fn eligibility_transition_a_table_present_not_loaded() {
-        let schema = make_schema_with_loading(
+        let schema = make_schema_with_table(
             "users",
             vec![("id", "int", true)],
             false,
@@ -975,7 +957,7 @@ mod tests {
     /// （loading フラグは eligibility 判定に影響しないことの保証）
     #[test]
     fn eligibility_transition_a_loading_in_progress_still_not_loaded() {
-        let schema = make_schema_with_loading(
+        let schema = make_schema_with_table(
             "users",
             vec![("id", "int", true)],
             false,
@@ -990,7 +972,7 @@ mod tests {
     /// （自動フェッチ完了後に Ok 状態へ遷移することの保証）
     #[test]
     fn eligibility_transition_b_loaded_with_pk_yields_ok() {
-        let schema = make_schema_with_loading(
+        let schema = make_schema_with_table(
             "users",
             vec![("id", "int", true), ("name", "varchar", false)],
             true,
@@ -1011,7 +993,7 @@ mod tests {
     /// （自動フェッチ完了後に PK が無いことが判明するケース）
     #[test]
     fn eligibility_transition_c_loaded_without_pk_yields_no_primary_key() {
-        let schema = make_schema_with_loading(
+        let schema = make_schema_with_table(
             "users",
             vec![("id", "int", false), ("name", "varchar", false)],
             true,
@@ -1026,7 +1008,7 @@ mod tests {
     /// （DB 側に該当テーブルがない場合の従来挙動が保たれる）
     #[test]
     fn eligibility_transition_d_table_absent_in_schema() {
-        let schema = make_schema_with_loading(
+        let schema = make_schema_with_table(
             "orders",
             vec![("id", "int", true)],
             true,
@@ -1041,7 +1023,7 @@ mod tests {
     /// → 大文字小文字を無視して Ok 判定される（case-insensitive 照合の保証）
     #[test]
     fn eligibility_transition_e_case_insensitive_table_match() {
-        let schema = make_schema_with_loading(
+        let schema = make_schema_with_table(
             "users",
             vec![("id", "int", true), ("name", "varchar", false)],
             true,
