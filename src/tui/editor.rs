@@ -856,6 +856,12 @@ impl Scrollable for EditorState {
     fn h_page_right(&mut self) {
         self.move_h_page_right();
     }
+
+    fn center_on_cursor(&mut self, page_size: usize) {
+        // カーソル行を画面中央に持ってくる: scroll_offset = cursor_row - page_size/2
+        let half = page_size / 2;
+        self.scroll_offset = self.cursor.0.saturating_sub(half);
+    }
 }
 
 // ── ヘルパー ──

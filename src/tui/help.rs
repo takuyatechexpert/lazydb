@@ -48,6 +48,7 @@ pub fn render(f: &mut Frame, area: Rect) {
         help_line("PgDn/PgUp", "縦20単位移動"),
         help_line("Ctrl+D/Ctrl+U", "縦20単位移動"),
         help_line("H / L", "横40単位移動"),
+        help_line("zz", "カーソル行を画面中央に寄せる"),
         Line::raw(""),
         Line::from(Span::styled(
             "Schema Browser",

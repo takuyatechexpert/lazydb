@@ -8,6 +8,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
+use std::cell::Cell;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// NULL セルの表示文字列
@@ -30,7 +31,11 @@ pub struct ResultsState {
     /// 行データ。`Option<String>` の `None` は SQL の NULL を表す。
     pub rows: Vec<Vec<Option<String>>>,
     pub col_widths: Vec<usize>,
+    /// フォーカス行（cursor）。0-based 行番号。
     pub scroll_offset: usize,
+    /// ビューの先頭行（zz による再センタリングや上下スクロール対応）。
+    /// 描画時に cursor を可視範囲に保つようクランプされる。
+    pub view_offset: Cell<usize>,
     pub h_scroll: usize,
     pub status: ResultStatus,
     pub duration_ms: u64,
@@ -51,6 +56,7 @@ impl ResultsState {
             rows: Vec::new(),
             col_widths: Vec::new(),
             scroll_offset: 0,
+            view_offset: Cell::new(0),
             h_scroll: 0,
             status: ResultStatus::Empty,
             duration_ms: 0,
@@ -75,6 +81,7 @@ impl ResultsState {
         self.result = Some(result);
         self.auto_limited = auto_limited;
         self.scroll_offset = 0;
+        self.view_offset.set(0);
         self.h_scroll = 0;
         self.status = ResultStatus::Success;
         self.last_query = Some(query);
@@ -90,6 +97,7 @@ impl ResultsState {
         self.rows.clear();
         self.col_widths.clear();
         self.scroll_offset = 0;
+        self.view_offset.set(0);
         self.status = ResultStatus::Error(msg);
         // エラー時は cc 対象にならないのでラベルもリセット
         self.cc_eligibility = CcEligibility::NotSelect;
@@ -230,6 +238,12 @@ impl Scrollable for ResultsState {
     fn h_page_right(&mut self) {
         ResultsState::h_page_right(self);
     }
+
+    fn center_on_cursor(&mut self, page_size: usize) {
+        // フォーカス行を画面中央に: view_offset = scroll_offset - page_size/2
+        let half = page_size / 2;
+        self.view_offset.set(self.scroll_offset.saturating_sub(half));
+    }
 }
 
 // ── 描画 ──
@@ -311,7 +325,25 @@ fn render_table(f: &mut Frame, results: &ResultsState, is_focused: bool, area: R
 
     // データ行（表示可能な分だけ）
     let data_height = area.height as usize - 3; // header + sep + footer
-    let start = results.scroll_offset;
+    // ビュー先頭をクランプして cursor を可視範囲に保つ（vim 風: 通常はビュー固定、はみ出した時だけ追従）
+    let cursor_row = results.scroll_offset;
+    let total = results.rows.len();
+    let mut start = results.view_offset.get();
+    if data_height == 0 || total == 0 {
+        start = 0;
+    } else {
+        let max_offset = total.saturating_sub(data_height);
+        if start > max_offset {
+            start = max_offset;
+        }
+        if cursor_row < start {
+            start = cursor_row;
+        }
+        if cursor_row >= start + data_height {
+            start = cursor_row + 1 - data_height;
+        }
+    }
+    results.view_offset.set(start);
     let end = (start + data_height).min(results.rows.len());
 
     for i in start..end {

@@ -34,6 +34,7 @@ use ratatui::{
 use cc_edit::{CcAnalysis, CcEligibility};
 use results::ResultsState;
 use schema::{ColumnEntry, SchemaState, TableEntry};
+use scrollable::Scrollable;
 use std::io;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
@@ -347,6 +348,8 @@ pub struct App {
     pub new_conn_form: NewConnectionForm,
     // 接続時に解決済みのパスワード
     pub resolved_password: Option<String>,
+    /// vim の `zz` 2 連打検出: 直前のキーが（フォーカス中ペインで）`z` だったときだけ true
+    pub pending_z: bool,
 }
 
 impl App {
@@ -375,6 +378,7 @@ impl App {
             spinner_frame: 0,
             new_conn_form: NewConnectionForm::new(),
             resolved_password: None,
+            pending_z: false,
         }
     }
 
@@ -608,6 +612,11 @@ impl App {
             return std::ops::ControlFlow::Break(());
         }
 
+        // Normal モード以外では zz チョード状態を保持しない
+        if !matches!(self.mode, AppMode::Normal) {
+            self.pending_z = false;
+        }
+
         match &self.mode {
             AppMode::ConnectionPicker => self.handle_picker_key(key),
             AppMode::NewConnectionWizard => self.handle_new_conn_key(key),
@@ -701,6 +710,29 @@ impl App {
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> std::ops::ControlFlow<()> {
         let idx = self.active_tab;
+
+        // zz チョード: 各ペインのカーソル行を画面中央へ寄せる
+        // Editor の Insert モードでは 'z' は通常文字入力なので除外
+        let in_editor_insert = self.active_panel == Panel::Editor
+            && self.tabs[idx].editor.mode == editor::EditorMode::Insert;
+        if !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !in_editor_insert
+            && key.code == KeyCode::Char('z')
+        {
+            if self.pending_z {
+                self.pending_z = false;
+                match self.active_panel {
+                    Panel::Schema => self.schema.center_on_cursor(20),
+                    Panel::Editor => self.tabs[idx].editor.center_on_cursor(20),
+                    Panel::Results => self.tabs[idx].results.center_on_cursor(20),
+                }
+            } else {
+                self.pending_z = true;
+            }
+            return std::ops::ControlFlow::Continue(());
+        }
+        // z 以外の通常キーは pending_z をリセット（チョード中断）
+        self.pending_z = false;
 
         // Ctrl+C: 接続切り替え
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {

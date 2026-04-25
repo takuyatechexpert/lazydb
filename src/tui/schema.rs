@@ -237,6 +237,12 @@ impl Scrollable for SchemaState {
     fn h_page_right(&mut self) {
         // no-op
     }
+
+    fn center_on_cursor(&mut self, page_size: usize) {
+        // カーソル行を画面中央に: view top = cursor - page_size/2
+        let half = page_size / 2;
+        self.scroll_offset.set(self.cursor.saturating_sub(half));
+    }
 }
 
 // ── 描画 ──

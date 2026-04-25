@@ -21,6 +21,9 @@ pub trait Scrollable {
     fn page_up(&mut self, page_size: usize);
     fn h_page_left(&mut self);
     fn h_page_right(&mut self);
+    /// vim の `zz` 相当: カーソル行が画面中央に来るようビューを再センタリングする。
+    /// `page_size` は呼び出し側が見積もる縦の表示行数で、半分の値が中央位置の目安となる。
+    fn center_on_cursor(&mut self, page_size: usize);
 }
 
 /// `KeyEvent` を共通スクロールキーとして処理する。
@@ -151,6 +154,9 @@ mod tests {
         }
         fn h_page_right(&mut self) {
             self.events.push("h_page_right".into());
+        }
+        fn center_on_cursor(&mut self, page_size: usize) {
+            self.events.push(format!("center_on_cursor:{}", page_size));
         }
     }
 

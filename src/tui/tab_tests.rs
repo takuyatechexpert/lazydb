@@ -538,3 +538,183 @@ fn dispatch_scroll_key_works_via_trait_object() {
     }
     assert_eq!(e.cursor, (0, 0));
 }
+
+// ── center_on_cursor (zz) ──
+
+#[test]
+fn editor_center_on_cursor_centers_view_around_cursor_row() {
+    // cursor 50 行目で zz: scroll_offset = 50 - 20/2 = 40
+    let mut e = editor_with_lines(100);
+    e.cursor = (50, 0);
+    e.scroll_offset = 50;
+    Scrollable::center_on_cursor(&mut e, 20);
+    assert_eq!(e.scroll_offset, 40);
+}
+
+#[test]
+fn editor_center_on_cursor_clamps_at_zero_for_top_rows() {
+    // cursor が先頭付近では saturating_sub で 0 にクランプ
+    let mut e = editor_with_lines(100);
+    e.cursor = (3, 0);
+    e.scroll_offset = 0;
+    Scrollable::center_on_cursor(&mut e, 20);
+    assert_eq!(e.scroll_offset, 0);
+}
+
+#[test]
+fn results_center_on_cursor_sets_view_offset_around_cursor() {
+    let mut r = make_results(100);
+    r.scroll_offset = 50; // フォーカス行 = 50
+    Scrollable::center_on_cursor(&mut r, 20);
+    // view_offset = 50 - 10 = 40
+    assert_eq!(r.view_offset.get(), 40);
+    // フォーカス行（cursor）は変えない
+    assert_eq!(r.scroll_offset, 50);
+}
+
+#[test]
+fn results_center_on_cursor_clamps_at_zero_for_top_rows() {
+    let mut r = make_results(100);
+    r.scroll_offset = 5;
+    Scrollable::center_on_cursor(&mut r, 20);
+    assert_eq!(r.view_offset.get(), 0);
+}
+
+#[test]
+fn schema_center_on_cursor_sets_view_offset_around_cursor() {
+    let mut s = make_schema(100);
+    s.cursor = 60;
+    Scrollable::center_on_cursor(&mut s, 20);
+    assert_eq!(s.scroll_offset.get(), 50);
+}
+
+#[test]
+fn schema_center_on_cursor_clamps_at_zero_for_top_items() {
+    let mut s = make_schema(100);
+    s.cursor = 4;
+    Scrollable::center_on_cursor(&mut s, 20);
+    assert_eq!(s.scroll_offset.get(), 0);
+}
+
+// ── zz チョード（App レベル） ──
+
+fn z_key() -> KeyEvent {
+    KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)
+}
+
+#[test]
+fn first_z_press_sets_pending_z_without_centering() {
+    let mut app = test_app();
+    app.mode = AppMode::Normal;
+    app.active_panel = Panel::Editor;
+    // Editor を Normal モードに
+    let idx = app.active_tab;
+    app.tabs[idx].editor.mode = EditorMode::Normal;
+
+    assert!(!app.pending_z);
+    let _ = app.handle_key(z_key());
+    assert!(app.pending_z, "1 回目の z で pending_z が立つ");
+}
+
+#[test]
+fn second_z_press_triggers_zz_and_resets_pending() {
+    // Editor: 50 行のテキスト、cursor (50,0)、scroll_offset=50 → zz で 40 になる
+    let mut app = test_app();
+    app.mode = AppMode::Normal;
+    app.active_panel = Panel::Editor;
+    let idx = app.active_tab;
+    app.tabs[idx].editor.mode = EditorMode::Normal;
+    app.tabs[idx].editor.set_content(&(0..100).map(|i| format!("l{}", i)).collect::<Vec<_>>().join("\n"));
+    app.tabs[idx].editor.cursor = (50, 0);
+    app.tabs[idx].editor.scroll_offset = 50;
+
+    let _ = app.handle_key(z_key());
+    assert!(app.pending_z);
+    let _ = app.handle_key(z_key());
+
+    assert!(!app.pending_z, "zz 完了で pending_z はリセット");
+    assert_eq!(app.tabs[app.active_tab].editor.scroll_offset, 40);
+}
+
+#[test]
+fn other_key_between_z_resets_chord() {
+    let mut app = test_app();
+    app.mode = AppMode::Normal;
+    app.active_panel = Panel::Editor;
+    let idx = app.active_tab;
+    app.tabs[idx].editor.mode = EditorMode::Normal;
+    app.tabs[idx].editor.set_content(&(0..100).map(|i| format!("l{}", i)).collect::<Vec<_>>().join("\n"));
+    app.tabs[idx].editor.cursor = (50, 0);
+    app.tabs[idx].editor.scroll_offset = 50;
+
+    let _ = app.handle_key(z_key());
+    assert!(app.pending_z);
+    // 別のキー (j) を挟むとチョードがキャンセルされる
+    let _ = app.handle_key(key(KeyCode::Char('j')));
+    assert!(!app.pending_z);
+    // 次の z は再び 1 回目扱い → センタリングは起きない
+    let _ = app.handle_key(z_key());
+    assert!(app.pending_z);
+    assert_eq!(app.tabs[app.active_tab].editor.scroll_offset, 50, "z 1 回ではセンタリングしない");
+}
+
+#[test]
+fn zz_in_editor_insert_mode_inserts_z_instead_of_centering() {
+    let mut app = test_app();
+    app.mode = AppMode::Normal;
+    app.active_panel = Panel::Editor;
+    let idx = app.active_tab;
+    app.tabs[idx].editor.set_content("");
+    app.tabs[idx].editor.enter_insert();
+
+    let _ = app.handle_key(z_key());
+    let _ = app.handle_key(z_key());
+    // Insert モードでは z は通常文字として挿入される
+    assert_eq!(app.tabs[app.active_tab].editor.lines.first().map(|s| s.as_str()), Some("zz"));
+    assert!(!app.pending_z);
+}
+
+#[test]
+fn zz_works_in_results_pane() {
+    let mut app = test_app();
+    app.mode = AppMode::Normal;
+    app.active_panel = Panel::Results;
+    let idx = app.active_tab;
+    app.tabs[idx].results = make_results(100);
+    app.tabs[idx].results.scroll_offset = 60;
+
+    let _ = app.handle_key(z_key());
+    let _ = app.handle_key(z_key());
+    assert_eq!(app.tabs[app.active_tab].results.view_offset.get(), 50);
+    assert_eq!(app.tabs[app.active_tab].results.scroll_offset, 60);
+}
+
+#[test]
+fn zz_works_in_schema_pane() {
+    let mut app = test_app();
+    app.mode = AppMode::Normal;
+    app.active_panel = Panel::Schema;
+    app.schema = make_schema(100);
+    app.schema.cursor = 70;
+
+    let _ = app.handle_key(z_key());
+    let _ = app.handle_key(z_key());
+    assert_eq!(app.schema.scroll_offset.get(), 60);
+}
+
+#[test]
+fn pending_z_resets_on_mode_change() {
+    let mut app = test_app();
+    app.mode = AppMode::Normal;
+    app.active_panel = Panel::Editor;
+    let idx = app.active_tab;
+    app.tabs[idx].editor.mode = EditorMode::Normal;
+
+    let _ = app.handle_key(z_key());
+    assert!(app.pending_z);
+
+    // モードを切り替えた直後にキーを受けると pending_z はリセットされる
+    app.mode = AppMode::Help;
+    let _ = app.handle_key(key(KeyCode::Esc));
+    assert!(!app.pending_z);
+}
