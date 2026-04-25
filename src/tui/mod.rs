@@ -505,7 +505,13 @@ impl App {
                             tab.results.set_result(qr, auto_limited, original_query.clone());
                             let analysis = CcAnalysis::from_query(&original_query);
                             let eligibility = cc_edit::compute_eligibility(&analysis, &self.schema);
-                            tab.results.set_cc_eligibility(eligibility);
+                            tab.results.set_cc_eligibility(eligibility.clone());
+                            if matches!(eligibility, CcEligibility::ColumnsNotLoaded) {
+                                if let Some(ref table) = analysis.table {
+                                    let table = table.clone();
+                                    self.maybe_auto_fetch_columns(&table);
+                                }
+                            }
                             self.status_message = Some(format!(
                                 "{} rows  ({:.3}s)",
                                 row_count,
@@ -553,9 +559,47 @@ impl App {
                         }
                     }
                 }
+                // schema が更新された可能性があるので、last_query を持つ全タブの cc_eligibility を再計算
+                let schema = &self.schema;
+                for tab in self.tabs.iter_mut() {
+                    if let Some(last_query) = tab.results.last_query.as_deref() {
+                        let analysis = CcAnalysis::from_query(last_query);
+                        let eligibility = cc_edit::compute_eligibility(&analysis, schema);
+                        tab.results.set_cc_eligibility(eligibility);
+                    }
+                }
                 std::ops::ControlFlow::Continue(())
             }
         }
+    }
+
+    /// 指定テーブルのカラム情報がロード済みでもロード中でもなければ、
+    /// fetch_columns をバックグラウンドで発行する。
+    /// - schema.tables に該当テーブルが無い場合は何もしない
+    /// - active_connection が無い or ConnectionConfig が取得できない場合は何もしない
+    fn maybe_auto_fetch_columns(&mut self, table: &str) {
+        let Some(conn) = self.connections.get(self.picker_cursor).cloned() else {
+            return;
+        };
+        let Some(entry) = self
+            .schema
+            .tables
+            .iter_mut()
+            .find(|t| t.name.eq_ignore_ascii_case(table))
+        else {
+            return;
+        };
+        if entry.columns_loaded || entry.columns_loading {
+            return;
+        }
+        entry.columns_loading = true;
+        let table_name = entry.name.clone();
+        spawn_fetch_columns(
+            &conn,
+            &table_name,
+            self.resolved_password.clone(),
+            self.tx.clone(),
+        );
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> std::ops::ControlFlow<()> {
