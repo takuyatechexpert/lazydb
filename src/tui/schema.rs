@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -22,6 +24,8 @@ pub struct SchemaState {
     pub tables: Vec<TableEntry>,
     /// フラット化した表示リスト上のカーソル位置
     pub cursor: usize,
+    /// 表示開始位置（描画時にカーソルが見える範囲を維持するため調整される）
+    pub scroll_offset: Cell<usize>,
     /// 読み込み中フラグ
     pub loading: bool,
     /// スピナーフレーム
@@ -51,6 +55,7 @@ impl SchemaState {
         Self {
             tables: Vec::new(),
             cursor: 0,
+            scroll_offset: Cell::new(0),
             loading: false,
             spinner_frame: 0,
         }
@@ -261,13 +266,35 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    // スクロール: カーソルが見える位置にする
+    // スクロール: カーソルが画面外に出たときだけオフセットを動かす
     let inner_height = area.height.saturating_sub(2) as usize; // borders
-    let offset = if app.schema.cursor >= inner_height {
-        app.schema.cursor - inner_height + 1
+    let total = list_items.len();
+    let cursor = app.schema.cursor;
+    let mut offset = app.schema.scroll_offset.get();
+
+    if inner_height == 0 {
+        offset = 0;
     } else {
-        0
-    };
+        // 全体が収まるならオフセット 0
+        if total <= inner_height {
+            offset = 0;
+        } else {
+            // 末尾以降にはみ出していたら縮める
+            let max_offset = total - inner_height;
+            if offset > max_offset {
+                offset = max_offset;
+            }
+            // カーソルが画面より上 → 上にスクロール
+            if cursor < offset {
+                offset = cursor;
+            }
+            // カーソルが画面より下 → 下にスクロール
+            if cursor >= offset + inner_height {
+                offset = cursor + 1 - inner_height;
+            }
+        }
+    }
+    app.schema.scroll_offset.set(offset);
 
     let visible: Vec<ListItem> = list_items.into_iter().skip(offset).collect();
     let list = List::new(visible).block(block);
