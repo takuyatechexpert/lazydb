@@ -31,6 +31,10 @@ pub struct SchemaState {
     pub loading: bool,
     /// スピナーフレーム
     pub spinner_frame: usize,
+    /// `/` 検索モード入力中フラグ
+    pub search_active: bool,
+    /// 現在の検索クエリ（小文字 substring マッチ）
+    pub search_query: String,
 }
 
 #[derive(Debug, Clone)]
@@ -59,7 +63,111 @@ impl SchemaState {
             scroll_offset: Cell::new(0),
             loading: false,
             spinner_frame: 0,
+            search_active: false,
+            search_query: String::new(),
         }
+    }
+
+    // ── 検索モード ──
+
+    /// `/` を押されたとき: 検索モードに入りクエリをクリアする
+    pub fn enter_search(&mut self) {
+        self.search_active = true;
+        self.search_query.clear();
+    }
+
+    /// Esc: 検索モードを抜けてクエリも破棄する
+    pub fn cancel_search(&mut self) {
+        self.search_active = false;
+        self.search_query.clear();
+    }
+
+    /// Enter: 検索モードを抜けてクエリは保持する（n/N で再ジャンプ可能）
+    pub fn confirm_search(&mut self) {
+        self.search_active = false;
+    }
+
+    /// 検索クエリに 1 文字追加し、現在カーソル位置から前方の最初のマッチへジャンプする
+    pub fn push_search_char(&mut self, ch: char) {
+        self.search_query.push(ch);
+        if let Some(pos) = self.find_match(self.cursor, true) {
+            self.cursor = pos;
+        }
+    }
+
+    /// 検索クエリの末尾 1 文字を削除し、再度カーソル位置から前方検索する
+    pub fn pop_search_char(&mut self) {
+        self.search_query.pop();
+        if !self.search_query.is_empty() {
+            if let Some(pos) = self.find_match(self.cursor, true) {
+                self.cursor = pos;
+            }
+        }
+    }
+
+    /// `n`: カーソルより後ろの次のマッチへ移動
+    pub fn find_next(&mut self) -> bool {
+        if self.search_query.is_empty() {
+            return false;
+        }
+        let start = self.cursor.saturating_add(1);
+        if let Some(pos) = self.find_match(start, true) {
+            self.cursor = pos;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `N`: カーソルより前の前のマッチへ移動
+    pub fn find_prev(&mut self) -> bool {
+        if self.search_query.is_empty() {
+            return false;
+        }
+        let start = self.cursor.saturating_sub(1);
+        if let Some(pos) = self.find_match(start, false) {
+            self.cursor = pos;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `start` を起点に flat_items 内のテーブル名マッチ位置を探す。
+    /// - `forward=true`: start から末尾→先頭へラップ
+    /// - `forward=false`: start から先頭→末尾へラップ
+    ///
+    /// 大文字小文字無視の substring マッチ。
+    fn find_match(&self, start: usize, forward: bool) -> Option<usize> {
+        let items = self.flat_items();
+        if items.is_empty() || self.search_query.is_empty() {
+            return None;
+        }
+        let needle = self.search_query.to_lowercase();
+        let len = items.len();
+
+        // 末尾を超えた場合は wrap させる: forward なら 0 から、backward なら末尾から走査
+        let order: Vec<usize> = if forward {
+            if start >= len {
+                (0..len).collect()
+            } else {
+                (start..len).chain(0..start).collect()
+            }
+        } else {
+            let s = start.min(len - 1);
+            let mut v: Vec<usize> = (0..=s).rev().collect();
+            v.extend((s + 1..len).rev());
+            v
+        };
+
+        for i in order {
+            if let SchemaItem::Table { name, .. } = &items[i] {
+                if name.to_lowercase().contains(&needle) {
+                    return Some(i);
+                }
+            }
+        }
+        None
     }
 
     /// フラット化した表示アイテムリストを生成
@@ -281,7 +389,22 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // 検索バーを描画する場合は inner の最下行を 1 行検索バー用に確保する
+    let show_search_bar = app.schema.search_active || !app.schema.search_query.is_empty();
+    let search_bar_area = if show_search_bar && area.height >= 4 {
+        Some(Rect {
+            x: area.x + 1,
+            y: area.y + area.height - 2,
+            width: area.width.saturating_sub(2),
+            height: 1,
+        })
+    } else {
+        None
+    };
+    let list_area = area;
+
     let items = app.schema.flat_items();
+    let needle_lower = app.schema.search_query.to_lowercase();
     let list_items: Vec<ListItem> = items
         .iter()
         .enumerate()
@@ -303,10 +426,22 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                     } else {
                         String::new()
                     };
-                    ListItem::new(Line::from(vec![
-                        Span::raw(if is_selected && is_focused { ">" } else { " " }),
-                        Span::styled(format!("{}{}{}", prefix, name, suffix), style),
-                    ]))
+                    let cursor_mark = Span::raw(if is_selected && is_focused { ">" } else { " " });
+                    let prefix_span = Span::styled(prefix.to_string(), style);
+
+                    // 検索クエリにマッチする部分をハイライト
+                    let name_spans = if !needle_lower.is_empty() {
+                        highlight_match(name, &needle_lower, style)
+                    } else {
+                        vec![Span::styled(name.clone(), style)]
+                    };
+
+                    let mut spans = vec![cursor_mark, prefix_span];
+                    spans.extend(name_spans);
+                    if !suffix.is_empty() {
+                        spans.push(Span::styled(suffix, style));
+                    }
+                    ListItem::new(Line::from(spans))
                 }
                 SchemaItem::Column { name, col_type } => {
                     let style = if is_selected && is_focused {
@@ -328,7 +463,9 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     // スクロール: カーソルが画面外に出たときだけオフセットを動かす
-    let inner_height = area.height.saturating_sub(2) as usize; // borders
+    // 検索バーが出ているときは List 下端 1 行分を予約
+    let inner_height = (list_area.height.saturating_sub(2) as usize)
+        .saturating_sub(if search_bar_area.is_some() { 1 } else { 0 });
     let total = list_items.len();
     let cursor = app.schema.cursor;
     let mut offset = app.schema.scroll_offset.get();
@@ -357,9 +494,61 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     }
     app.schema.scroll_offset.set(offset);
 
-    let visible: Vec<ListItem> = list_items.into_iter().skip(offset).collect();
+    let visible: Vec<ListItem> = list_items
+        .into_iter()
+        .skip(offset)
+        .take(inner_height.max(1))
+        .collect();
     let list = List::new(visible).block(block);
-    f.render_widget(list, area);
+    f.render_widget(list, list_area);
+
+    // 検索バー（border 内の最下部に上書き描画）
+    if let Some(bar) = search_bar_area {
+        let cursor_glyph = if app.schema.search_active { "█" } else { "" };
+        let prompt_color = if app.schema.search_active {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
+        let line = Line::from(vec![
+            Span::styled("/", Style::default().fg(prompt_color)),
+            Span::raw(app.schema.search_query.clone()),
+            Span::styled(cursor_glyph, Style::default().fg(Color::Gray)),
+        ]);
+        f.render_widget(Paragraph::new(line), bar);
+    }
+}
+
+/// 検索クエリにマッチする部分文字列を Yellow で強調した Span 列を返す。
+/// `needle` は事前に小文字化しておくこと。
+fn highlight_match<'a>(haystack: &'a str, needle: &str, base: Style) -> Vec<Span<'a>> {
+    let lower = haystack.to_lowercase();
+    let mut spans: Vec<Span<'a>> = Vec::new();
+    let mut last = 0usize;
+    let mut search_from = 0usize;
+    while let Some(rel) = lower[search_from..].find(needle) {
+        let start = search_from + rel;
+        let end = start + needle.len();
+        if start > last {
+            spans.push(Span::styled(haystack[last..start].to_string(), base));
+        }
+        spans.push(Span::styled(
+            haystack[start..end].to_string(),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        last = end;
+        search_from = end;
+    }
+    if last < haystack.len() {
+        spans.push(Span::styled(haystack[last..].to_string(), base));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(haystack.to_string(), base));
+    }
+    spans
 }
 #[cfg(test)]
 mod tests {
@@ -570,5 +759,137 @@ mod tests {
         s.cursor = 0;
         s.page_up(20);
         assert_eq!(s.cursor, 0);
+    }
+
+    // ── 検索モード ──
+
+    /// 検索テスト用: マッチがちょうど 2 件（idx 2, 4）に来るようにした名前セット。
+    /// "xx" を含むのは "ccc_xx" と "eee_xx" のみ。
+    fn schema_for_search() -> SchemaState {
+        let mut s = SchemaState::new();
+        for n in &["aaa", "bbb", "ccc_xx", "ddd", "eee_xx"] {
+            s.tables.push(TableEntry {
+                name: n.to_string(),
+                expanded: false,
+                columns_loaded: false,
+                columns_loading: false,
+                columns: Vec::new(),
+            });
+        }
+        s
+    }
+
+    #[test]
+    fn search_enter_clears_query_and_activates() {
+        let mut s = schema_for_search();
+        s.search_query = "old".to_string();
+        s.enter_search();
+        assert!(s.search_active);
+        assert_eq!(s.search_query, "");
+    }
+
+    #[test]
+    fn search_push_char_jumps_cursor_to_first_match() {
+        let mut s = schema_for_search();
+        s.cursor = 0;
+        s.enter_search();
+        s.push_search_char('x');
+        // "x" を含むのは "ccc_xx"(2) と "eee_xx"(4)。前方検索で 2 にジャンプ
+        assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn search_is_case_insensitive() {
+        let mut s = schema_for_search();
+        s.cursor = 0;
+        s.enter_search();
+        s.push_search_char('X'); // 大文字でも小文字 'xx' にマッチ
+        assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn search_pop_char_keeps_query_navigation_consistent() {
+        let mut s = schema_for_search();
+        s.cursor = 0;
+        s.enter_search();
+        s.push_search_char('x');
+        s.push_search_char('x');
+        assert_eq!(s.cursor, 2); // ccc_xx
+        s.pop_search_char();
+        // クエリは "x" のまま。現在 cursor=2 から前方検索 → 自身がマッチするので 2 のまま
+        assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn find_next_advances_to_next_match_and_wraps() {
+        let mut s = schema_for_search();
+        s.search_query = "xx".to_string();
+        s.cursor = 0;
+        assert!(s.find_next()); // 0 → 2
+        assert_eq!(s.cursor, 2);
+        assert!(s.find_next()); // 2 → 4
+        assert_eq!(s.cursor, 4);
+        assert!(s.find_next()); // 4 → ラップして 2
+        assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn find_prev_retreats_to_previous_match_and_wraps() {
+        let mut s = schema_for_search();
+        s.search_query = "xx".to_string();
+        s.cursor = 4; // eee_xx
+        assert!(s.find_prev()); // 4 → 2
+        assert_eq!(s.cursor, 2);
+        assert!(s.find_prev()); // 2 → ラップして 4
+        assert_eq!(s.cursor, 4);
+    }
+
+    #[test]
+    fn find_next_with_empty_query_returns_false() {
+        let mut s = schema_for_search();
+        s.search_query.clear();
+        assert!(!s.find_next());
+    }
+
+    #[test]
+    fn find_next_no_match_returns_false_without_moving() {
+        let mut s = schema_for_search();
+        s.cursor = 2;
+        s.search_query = "xyz_no_match".to_string();
+        assert!(!s.find_next());
+        assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn cancel_search_clears_query() {
+        let mut s = schema_for_search();
+        s.enter_search();
+        s.push_search_char('u');
+        s.cancel_search();
+        assert!(!s.search_active);
+        assert_eq!(s.search_query, "");
+    }
+
+    #[test]
+    fn confirm_search_keeps_query_for_n_navigation() {
+        let mut s = schema_for_search();
+        s.enter_search();
+        s.push_search_char('u');
+        s.confirm_search();
+        assert!(!s.search_active);
+        assert_eq!(s.search_query, "u");
+    }
+
+    #[test]
+    fn search_skips_column_items_and_only_matches_tables() {
+        let mut s = schema_with(&[
+            ("users", true, &["name", "email"]),
+            ("orders", false, &[]),
+        ]);
+        // flat_items = [users(0), name(1), email(2), orders(3)]
+        s.cursor = 0;
+        s.search_query = "name".to_string();
+        // "name" はカラム名のみで、テーブル名にはマッチしない
+        assert!(!s.find_next());
     }
 }

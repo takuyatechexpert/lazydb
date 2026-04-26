@@ -711,6 +711,13 @@ impl App {
     fn handle_normal_key(&mut self, key: KeyEvent) -> std::ops::ControlFlow<()> {
         let idx = self.active_tab;
 
+        // Schema パネルで `/` 検索入力中はすべてのキーを検索ハンドラに委譲する
+        // （Tab/?/Ctrl+* などのグローバルショートカットを横取りされないようにする）
+        if self.active_panel == Panel::Schema && self.schema.search_active {
+            self.handle_schema_search_input(key);
+            return std::ops::ControlFlow::Continue(());
+        }
+
         // zz チョード: 各ペインのカーソル行を画面中央へ寄せる
         // Editor の Insert モードでは 'z' は通常文字入力なので除外
         let in_editor_insert = self.active_panel == Panel::Editor
@@ -822,7 +829,59 @@ impl App {
         std::ops::ControlFlow::Continue(())
     }
 
+    /// `/` 検索モード入力中のキーハンドラ。
+    /// Enter で確定（クエリ保持）、Esc で取消（クエリ破棄）、Backspace で 1 文字削除、
+    /// その他の通常の Char は検索クエリへ追加する。
+    fn handle_schema_search_input(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.schema.cancel_search();
+            }
+            KeyCode::Enter => {
+                self.schema.confirm_search();
+            }
+            KeyCode::Backspace => {
+                if self.schema.search_query.is_empty() {
+                    // 空ならそのまま検索モード抜け
+                    self.schema.cancel_search();
+                } else {
+                    self.schema.pop_search_char();
+                }
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.schema.push_search_char(ch);
+            }
+            _ => {}
+        }
+    }
+
     fn handle_schema_key(&mut self, key: KeyEvent) {
+        // `/`, `n`, `N`, Esc は scrollable に渡す前に確実に拾う
+        match key.code {
+            KeyCode::Char('/') => {
+                self.schema.enter_search();
+                return;
+            }
+            KeyCode::Char('n') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !self.schema.find_next() && !self.schema.search_query.is_empty() {
+                    self.status_message =
+                        Some(format!("一致なし: {}", self.schema.search_query));
+                }
+                return;
+            }
+            KeyCode::Char('N') => {
+                if !self.schema.find_prev() && !self.schema.search_query.is_empty() {
+                    self.status_message =
+                        Some(format!("一致なし: {}", self.schema.search_query));
+                }
+                return;
+            }
+            KeyCode::Esc if !self.schema.search_query.is_empty() => {
+                self.schema.search_query.clear();
+                return;
+            }
+            _ => {}
+        }
         if scrollable::dispatch_scroll_key(&mut self.schema, &key, 20) {
             return;
         }

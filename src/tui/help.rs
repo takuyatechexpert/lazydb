@@ -58,6 +58,8 @@ pub fn render(f: &mut Frame, area: Rect) {
         help_line("s", "クイック SELECT * FROM"),
         help_line("y", "テーブル名をコピー"),
         help_line("r", "スキーマ再読み込み"),
+        help_line("/", "テーブル名検索（Enter 確定 / Esc 取消）"),
+        help_line("n / N", "次/前の一致へ移動"),
         Line::raw(""),
         Line::from(Span::styled(
             "Editor Normal",
