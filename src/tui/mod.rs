@@ -718,12 +718,23 @@ impl App {
             return std::ops::ControlFlow::Continue(());
         }
 
+        // Editor パネルで `/` 検索入力中も同様に検索ハンドラへ委譲する
+        if self.active_panel == Panel::Editor && self.tabs[idx].editor.search.active {
+            self.handle_editor_search_input(key);
+            return std::ops::ControlFlow::Continue(());
+        }
+
         // zz チョード: 各ペインのカーソル行を画面中央へ寄せる
-        // Editor の Insert モードでは 'z' は通常文字入力なので除外
-        let in_editor_insert = self.active_panel == Panel::Editor
-            && self.tabs[idx].editor.mode == editor::EditorMode::Insert;
+        // Editor の Insert/Visual/VisualLine モードでは 'z' は別意味なので除外
+        let in_editor_text_input = self.active_panel == Panel::Editor
+            && matches!(
+                self.tabs[idx].editor.mode,
+                editor::EditorMode::Insert
+                    | editor::EditorMode::Visual
+                    | editor::EditorMode::VisualLine
+            );
         if !key.modifiers.contains(KeyModifiers::CONTROL)
-            && !in_editor_insert
+            && !in_editor_text_input
             && key.code == KeyCode::Char('z')
         {
             if self.pending_z {
@@ -815,7 +826,8 @@ impl App {
                 self.active_panel = self.active_panel.prev();
                 self.tabs[self.active_tab].pending_c = false;
             }
-            KeyCode::Char('?') if !(self.active_panel == Panel::Editor && self.tabs[idx].editor.mode == editor::EditorMode::Insert) => {
+            KeyCode::Char('?') if !(self.active_panel == Panel::Editor && self.tabs[idx].editor.mode == editor::EditorMode::Insert)
+                && !(self.active_panel == Panel::Editor && self.tabs[idx].editor.search.active) => {
                 self.mode = AppMode::Help;
             }
             _ => {
@@ -936,17 +948,67 @@ impl App {
 
     fn handle_editor_key(&mut self, key: KeyEvent) {
         let idx = self.active_tab;
+        if self.tabs[idx].editor.search.active {
+            self.handle_editor_search_input(key);
+            return;
+        }
         match self.tabs[idx].editor.mode {
             editor::EditorMode::Normal => self.handle_editor_normal_key(key),
             editor::EditorMode::Insert => self.handle_editor_insert_key(key),
+            editor::EditorMode::Visual | editor::EditorMode::VisualLine => {
+                self.handle_editor_visual_key(key)
+            }
+        }
+    }
+
+    /// Editor の `/` 検索バー入力中のキーハンドラ。
+    fn handle_editor_search_input(&mut self, key: KeyEvent) {
+        let idx = self.active_tab;
+        let editor = &mut self.tabs[idx].editor;
+        match key.code {
+            KeyCode::Esc => {
+                editor.search_cancel();
+            }
+            KeyCode::Enter => {
+                editor.search_confirm();
+                if editor.search.matches.is_empty() && !editor.search.query.is_empty() {
+                    let q = editor.search.query.clone();
+                    self.status_message = Some(format!("一致なし: {}", q));
+                }
+            }
+            KeyCode::Backspace => {
+                if editor.search.query.is_empty() {
+                    editor.search_cancel();
+                } else {
+                    editor.search_pop_char();
+                }
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                editor.search_push_char(ch);
+            }
+            _ => {}
         }
     }
 
     fn handle_editor_normal_key(&mut self, key: KeyEvent) {
         let idx = self.active_tab;
+        // 保留中のチョード（r/g/d/c/y/di/ci/yi）を最優先で処理
+        let pending = self.tabs[idx].editor.pending_keys.clone();
+        if !pending.is_empty() {
+            self.handle_editor_normal_chord(&pending, key);
+            return;
+        }
+
         // 共通スクロール・画面移動キー（h/j/k/l/g/G/0/$/PageUp/PageDown/Ctrl+D/Ctrl+U/H/L/Home/End/矢印）
-        // を先に dispatch する。dispatch を冒頭に置くことで Char('d')(ctrl=false) は dispatch を素通りし、
-        // 下の match arm の delete_line() に到達する。Ctrl+D は dispatch で page_down として消費される。
+        // を先に dispatch する。pending が無い前提なので g 単独はチョード待機に回したい。
+        // → g/G は dispatch 任せだと gg のチョードが扱えないため、g 単独だけ手前で捕まえる。
+        if let KeyCode::Char('g') = key.code {
+            if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                self.tabs[idx].editor.pending_keys.push('g');
+                return;
+            }
+        }
+
         if scrollable::dispatch_scroll_key(&mut self.tabs[idx].editor, &key, 20) {
             return;
         }
@@ -958,6 +1020,9 @@ impl App {
             KeyCode::Char('A') => self.tabs[idx].editor.enter_insert_end(),
             KeyCode::Char('o') => self.tabs[idx].editor.enter_insert_below(),
             KeyCode::Char('O') => self.tabs[idx].editor.enter_insert_above(),
+            // Visual モード
+            KeyCode::Char('v') => self.tabs[idx].editor.enter_visual(),
+            KeyCode::Char('V') => self.tabs[idx].editor.enter_visual_line(),
             // 単語移動
             KeyCode::Char('w') => self.tabs[idx].editor.move_word_forward(),
             KeyCode::Char('b') => self.tabs[idx].editor.move_word_back(),
@@ -965,13 +1030,44 @@ impl App {
             KeyCode::Char('^') => self.tabs[idx].editor.move_first_non_blank(),
             // 編集
             KeyCode::Char('x') => self.tabs[idx].editor.delete_char_at_cursor(),
-            KeyCode::Char('d') => {
-                // dd: 行削除（簡易実装: d を押したら即行削除）
-                self.tabs[idx].editor.delete_line();
-            }
+            KeyCode::Char('s') => self.tabs[idx].editor.substitute_char(),
+            KeyCode::Char('S') => self.tabs[idx].editor.substitute_line(),
+            KeyCode::Char('J') => self.tabs[idx].editor.join_lines(),
+            KeyCode::Char('~') => self.tabs[idx].editor.toggle_case(),
+            KeyCode::Char('p') => self.tabs[idx].editor.paste_after(),
+            KeyCode::Char('P') => self.tabs[idx].editor.paste_before(),
+            // チョード開始
+            KeyCode::Char('d') => self.tabs[idx].editor.pending_keys.push('d'),
+            KeyCode::Char('y') => self.tabs[idx].editor.pending_keys.push('y'),
+            KeyCode::Char('c') => self.tabs[idx].editor.pending_keys.push('c'),
+            KeyCode::Char('r') => self.tabs[idx].editor.pending_keys.push('r'),
+            // 単発の大文字オペレータ
             KeyCode::Char('D') => self.tabs[idx].editor.delete_to_end(),
             KeyCode::Char('C') => self.tabs[idx].editor.change_to_end(),
+            KeyCode::Char('Y') => self.tabs[idx].editor.yank_line(),
             KeyCode::Char('u') => self.tabs[idx].editor.undo(),
+            // 検索
+            KeyCode::Char('/') => self.tabs[idx].editor.search_start(),
+            KeyCode::Char('n') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.tabs[idx].editor.search.matches.is_empty()
+                    && !self.tabs[idx].editor.search.query.is_empty()
+                {
+                    let q = self.tabs[idx].editor.search.query.clone();
+                    self.status_message = Some(format!("一致なし: {}", q));
+                } else {
+                    self.tabs[idx].editor.next_match();
+                }
+            }
+            KeyCode::Char('N') => {
+                if self.tabs[idx].editor.search.matches.is_empty()
+                    && !self.tabs[idx].editor.search.query.is_empty()
+                {
+                    let q = self.tabs[idx].editor.search.query.clone();
+                    self.status_message = Some(format!("一致なし: {}", q));
+                } else {
+                    self.tabs[idx].editor.prev_match();
+                }
+            }
             // バッファ全体をフォーマット
             KeyCode::Char('=') => {
                 if self.tabs[idx].editor.format_buffer() {
@@ -979,6 +1075,212 @@ impl App {
                 } else {
                     self.status_message = Some("フォーマット対象がありません".to_string());
                 }
+            }
+            KeyCode::Esc => {
+                // 保留中のチョードをキャンセル
+                self.tabs[idx].editor.pending_keys.clear();
+            }
+            _ => {}
+        }
+    }
+
+    /// pending_keys に文字が積まれている状態で次のキーを処理する。
+    /// 完了したら pending_keys をクリアする。
+    fn handle_editor_normal_chord(&mut self, pending: &[char], key: KeyEvent) {
+        let idx = self.active_tab;
+        let editor = &mut self.tabs[idx].editor;
+
+        // r{char}: 1文字置換
+        if pending == ['r'] {
+            if let KeyCode::Char(ch) = key.code {
+                editor.replace_char(ch);
+            }
+            editor.pending_keys.clear();
+            return;
+        }
+
+        // gg
+        if pending == ['g'] {
+            match key.code {
+                KeyCode::Char('g') => editor.move_to_top(),
+                _ => {}
+            }
+            editor.pending_keys.clear();
+            return;
+        }
+
+        // d / y / c の 2 段目
+        if pending.len() == 1 && matches!(pending[0], 'd' | 'y' | 'c') {
+            let op = pending[0];
+            match key.code {
+                KeyCode::Char(c) if c == op => {
+                    // dd / yy / cc
+                    match op {
+                        'd' => editor.delete_line_yank(),
+                        'y' => editor.yank_line(),
+                        'c' => editor.substitute_line(),
+                        _ => {}
+                    }
+                    editor.pending_keys.clear();
+                    if op == 'y' {
+                        // yy 後は内部レジスタの内容をクリップボードにも反映
+                        if let Some(reg) = editor.register.clone() {
+                            let _ = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(reg.text));
+                        }
+                    }
+                    return;
+                }
+                KeyCode::Char('w') => {
+                    match op {
+                        'd' => editor.delete_word_forward(),
+                        'y' => editor.yank_word_forward(),
+                        'c' => editor.change_word_forward(),
+                        _ => {}
+                    }
+                    editor.pending_keys.clear();
+                    if op == 'y' {
+                        if let Some(reg) = editor.register.clone() {
+                            let _ = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(reg.text));
+                        }
+                    }
+                    return;
+                }
+                KeyCode::Char('i') => {
+                    editor.pending_keys.push('i');
+                    return;
+                }
+                KeyCode::Esc => {
+                    editor.pending_keys.clear();
+                    return;
+                }
+                _ => {
+                    // 不明なキーはチョードをキャンセル
+                    editor.pending_keys.clear();
+                    return;
+                }
+            }
+        }
+
+        // di / yi / ci の 3 段目（テキストオブジェクト）
+        if pending.len() == 2 && pending[1] == 'i' && matches!(pending[0], 'd' | 'y' | 'c') {
+            let op = pending[0];
+            match key.code {
+                KeyCode::Char('w') => {
+                    match op {
+                        'd' => editor.delete_inner_word(),
+                        'y' => editor.yank_inner_word(),
+                        'c' => editor.change_inner_word(),
+                        _ => {}
+                    }
+                    if op == 'y' {
+                        if let Some(reg) = editor.register.clone() {
+                            let _ = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(reg.text));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            editor.pending_keys.clear();
+            return;
+        }
+
+        // 想定外
+        editor.pending_keys.clear();
+    }
+
+    /// Visual / VisualLine モードのキーハンドラ。
+    fn handle_editor_visual_key(&mut self, key: KeyEvent) {
+        let idx = self.active_tab;
+        // 共通スクロール・画面移動キー（h/j/k/l/g/G/0/$/PageUp/PageDown/Ctrl+D/Ctrl+U/H/L/Home/End/矢印）
+        // を先に dispatch する。Visual モード中も移動で範囲を拡縮する。
+        if scrollable::dispatch_scroll_key(&mut self.tabs[idx].editor, &key, 20) {
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => self.tabs[idx].editor.enter_normal(),
+            KeyCode::Char('v') => {
+                // Visual 中に v: Normal へ。VisualLine 中に v: Visual へ
+                if self.tabs[idx].editor.mode == editor::EditorMode::Visual {
+                    self.tabs[idx].editor.enter_normal();
+                } else {
+                    self.tabs[idx].editor.mode = editor::EditorMode::Visual;
+                }
+            }
+            KeyCode::Char('V') => {
+                if self.tabs[idx].editor.mode == editor::EditorMode::VisualLine {
+                    self.tabs[idx].editor.enter_normal();
+                } else {
+                    self.tabs[idx].editor.mode = editor::EditorMode::VisualLine;
+                }
+            }
+            KeyCode::Char('o') => self.tabs[idx].editor.swap_visual_anchor(),
+            // 単語移動
+            KeyCode::Char('w') => self.tabs[idx].editor.move_word_forward(),
+            KeyCode::Char('b') => self.tabs[idx].editor.move_word_back(),
+            KeyCode::Char('e') => self.tabs[idx].editor.move_word_end(),
+            KeyCode::Char('^') => self.tabs[idx].editor.move_first_non_blank(),
+            // ヤンク
+            KeyCode::Char('y') => {
+                if let Some((text, kind)) = self.tabs[idx].editor.selection_text() {
+                    self.tabs[idx].editor.register = Some(editor::Register { text: text.clone(), kind });
+                    let _ = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text));
+                    self.status_message = Some("選択範囲をコピーしました".to_string());
+                }
+                self.tabs[idx].editor.enter_normal();
+            }
+            // 削除
+            KeyCode::Char('d') | KeyCode::Char('x') => {
+                if let Some((text, kind)) = self.tabs[idx].editor.delete_selection() {
+                    self.tabs[idx].editor.register = Some(editor::Register { text: text.clone(), kind });
+                    let _ = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text));
+                }
+            }
+            // 削除して Insert
+            KeyCode::Char('c') => {
+                if let Some((text, kind)) = self.tabs[idx].editor.delete_selection() {
+                    self.tabs[idx].editor.register = Some(editor::Register { text: text.clone(), kind });
+                    let _ = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text));
+                }
+                self.tabs[idx].editor.mode = editor::EditorMode::Insert;
+            }
+            // フォーマット（バッファ全体）
+            KeyCode::Char('=') => {
+                if self.tabs[idx].editor.format_buffer() {
+                    self.status_message = Some("クエリをフォーマットしました".to_string());
+                }
+                self.tabs[idx].editor.enter_normal();
+            }
+            // 大小反転
+            KeyCode::Char('~') => {
+                if let Some(((sr, sc), (er, ec))) = self.tabs[idx].editor.selection_range() {
+                    let mode = self.tabs[idx].editor.mode;
+                    self.tabs[idx].editor.save_snapshot_pub();
+                    let editor = &mut self.tabs[idx].editor;
+                    for r in sr..=er {
+                        let line = &editor.lines[r];
+                        let chars: Vec<char> = line.chars().collect();
+                        let s = if r == sr && mode == editor::EditorMode::Visual { sc } else { 0 };
+                        let e = if r == er && mode == editor::EditorMode::Visual {
+                            (ec + 1).min(chars.len())
+                        } else {
+                            chars.len()
+                        };
+                        let mut new_chars = chars.clone();
+                        for k in s..e {
+                            let c = new_chars[k];
+                            new_chars[k] = if c.is_uppercase() {
+                                c.to_lowercase().next().unwrap_or(c)
+                            } else if c.is_lowercase() {
+                                c.to_uppercase().next().unwrap_or(c)
+                            } else {
+                                c
+                            };
+                        }
+                        editor.lines[r] = new_chars.iter().collect();
+                    }
+                }
+                self.tabs[idx].editor.enter_normal();
             }
             _ => {}
         }
@@ -1725,10 +2027,14 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             let mode_str = match active_editor.mode {
                 editor::EditorMode::Normal => "NORMAL",
                 editor::EditorMode::Insert => "INSERT",
+                editor::EditorMode::Visual => "VISUAL",
+                editor::EditorMode::VisualLine => "V-LINE",
             };
             let mode_color = match active_editor.mode {
                 editor::EditorMode::Normal => Color::DarkGray,
                 editor::EditorMode::Insert => Color::Green,
+                editor::EditorMode::Visual => Color::Magenta,
+                editor::EditorMode::VisualLine => Color::LightMagenta,
             };
             (
                 "Editor".to_string(),

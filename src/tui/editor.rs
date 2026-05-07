@@ -30,6 +30,51 @@ const SQL_KEYWORDS: &[&str] = &[
 pub enum EditorMode {
     Normal,
     Insert,
+    Visual,
+    VisualLine,
+}
+
+/// ヤンク内容の種類（ペースト時の貼り方が変わる）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum YankKind {
+    Char,
+    Line,
+}
+
+#[derive(Debug, Clone)]
+pub struct Register {
+    pub text: String,
+    pub kind: YankKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct Search {
+    /// 検索バーで入力中
+    pub active: bool,
+    /// 確定済みの検索クエリ
+    pub query: String,
+    /// マッチ箇所 (行, 列開始, 長さ)
+    pub matches: Vec<(usize, usize, usize)>,
+    /// 現在の matches インデックス
+    pub current: usize,
+}
+
+impl Search {
+    pub fn new() -> Self {
+        Self {
+            active: false,
+            query: String::new(),
+            matches: Vec::new(),
+            current: 0,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.active = false;
+        self.query.clear();
+        self.matches.clear();
+        self.current = 0;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +144,14 @@ pub struct EditorState {
     pub executing: bool,
     /// オートコンプリート
     pub completion: Completion,
+    /// Visual モード開始位置 (行, 列)
+    pub visual_anchor: Option<(usize, usize)>,
+    /// Normal モード中のチョード待機キー列（"d", "di", "y", "g", "c", "r" 等）
+    pub pending_keys: Vec<char>,
+    /// 内部レジスタ（y / d で更新）
+    pub register: Option<Register>,
+    /// 検索状態
+    pub search: Search,
 }
 
 impl EditorState {
@@ -113,6 +166,10 @@ impl EditorState {
             redo_stack: Vec::new(),
             executing: false,
             completion: Completion::new(),
+            visual_anchor: None,
+            pending_keys: Vec::new(),
+            register: None,
+            search: Search::new(),
         }
     }
 
@@ -165,6 +222,12 @@ impl EditorState {
             self.undo_stack.remove(0);
         }
         self.redo_stack.clear();
+    }
+
+    /// 外部から undo スナップショットを記録するための公開ラッパ。
+    /// Visual モードの一括変換など、複数行の編集前に呼び出して使う。
+    pub fn save_snapshot_pub(&mut self) {
+        self.save_snapshot();
     }
 
     pub fn undo(&mut self) {
@@ -329,11 +392,637 @@ impl EditorState {
 
     /// Normal モードに戻る
     pub fn enter_normal(&mut self) {
+        let was_insert = self.mode == EditorMode::Insert;
         self.mode = EditorMode::Normal;
+        self.visual_anchor = None;
+        self.pending_keys.clear();
         // vim の挙動: Insert → Normal でカーソルが1つ左に戻る
-        let line_chars = char_count(&self.lines[self.cursor.0]);
-        if self.cursor.1 > 0 && self.cursor.1 >= line_chars && line_chars > 0 {
-            self.cursor.1 = line_chars - 1;
+        if was_insert {
+            let line_chars = char_count(&self.lines[self.cursor.0]);
+            if self.cursor.1 > 0 && self.cursor.1 >= line_chars && line_chars > 0 {
+                self.cursor.1 = line_chars - 1;
+            }
+        }
+    }
+
+    // ── Visual モード ──
+
+    /// Visual (charwise) を開始
+    pub fn enter_visual(&mut self) {
+        self.mode = EditorMode::Visual;
+        self.visual_anchor = Some(self.cursor);
+        self.pending_keys.clear();
+    }
+
+    /// VisualLine を開始
+    pub fn enter_visual_line(&mut self) {
+        self.mode = EditorMode::VisualLine;
+        self.visual_anchor = Some(self.cursor);
+        self.pending_keys.clear();
+    }
+
+    /// Visual 中、anchor とカーソルを入れ替える (o)
+    pub fn swap_visual_anchor(&mut self) {
+        if let Some(anchor) = self.visual_anchor {
+            self.visual_anchor = Some(self.cursor);
+            self.cursor = anchor;
+        }
+    }
+
+    /// 選択範囲を正規化された (start, end) で返す。
+    /// charwise は両端を含む文字インデックス、linewise は (start.0, _) と (end.0, end_line_char_count) のように行末まで。
+    pub fn selection_range(&self) -> Option<((usize, usize), (usize, usize))> {
+        let anchor = self.visual_anchor?;
+        let cursor = self.cursor;
+        let (start, end) = if anchor <= cursor {
+            (anchor, cursor)
+        } else {
+            (cursor, anchor)
+        };
+        match self.mode {
+            EditorMode::Visual => Some((start, end)),
+            EditorMode::VisualLine => {
+                let s = (start.0, 0);
+                let last_col = char_count(&self.lines[end.0]);
+                let e = (end.0, last_col);
+                Some((s, e))
+            }
+            _ => None,
+        }
+    }
+
+    /// 選択範囲のテキストを返す。VisualLine の場合は末尾改行付き。
+    pub fn selection_text(&self) -> Option<(String, YankKind)> {
+        let ((sr, sc), (er, ec)) = self.selection_range()?;
+        let kind = match self.mode {
+            EditorMode::VisualLine => YankKind::Line,
+            _ => YankKind::Char,
+        };
+        let text = if sr == er {
+            let line = &self.lines[sr];
+            let bs = char_to_byte_idx(line, sc);
+            // charwise の end は inclusive、linewise はそのまま行末
+            let be = match self.mode {
+                EditorMode::Visual => char_to_byte_idx(line, (ec + 1).min(char_count(line))),
+                _ => char_to_byte_idx(line, ec),
+            };
+            let mut s = line[bs..be].to_string();
+            if matches!(self.mode, EditorMode::VisualLine) {
+                s.push('\n');
+            }
+            s
+        } else {
+            let mut buf = String::new();
+            // 先頭行
+            let first_line = &self.lines[sr];
+            let bs = char_to_byte_idx(first_line, sc);
+            buf.push_str(&first_line[bs..]);
+            buf.push('\n');
+            // 中間行
+            for r in (sr + 1)..er {
+                buf.push_str(&self.lines[r]);
+                buf.push('\n');
+            }
+            // 終端行
+            let last_line = &self.lines[er];
+            let be = match self.mode {
+                EditorMode::Visual => char_to_byte_idx(last_line, (ec + 1).min(char_count(last_line))),
+                _ => char_to_byte_idx(last_line, ec),
+            };
+            buf.push_str(&last_line[..be]);
+            if matches!(self.mode, EditorMode::VisualLine) {
+                buf.push('\n');
+            }
+            buf
+        };
+        Some((text, kind))
+    }
+
+    /// 選択範囲を削除し、削除した内容（YankKind 付き）を返す。
+    /// Normal モードに戻る。
+    pub fn delete_selection(&mut self) -> Option<(String, YankKind)> {
+        let captured = self.selection_text()?;
+        let ((sr, sc), (er, ec)) = self.selection_range()?;
+        self.save_snapshot();
+
+        match self.mode {
+            EditorMode::VisualLine => {
+                // 行ごと削除
+                let drain_start = sr;
+                let drain_end = er + 1;
+                self.lines.drain(drain_start..drain_end);
+                if self.lines.is_empty() {
+                    self.lines.push(String::new());
+                }
+                let new_row = sr.min(self.lines.len() - 1);
+                self.cursor = (new_row, 0);
+            }
+            EditorMode::Visual => {
+                if sr == er {
+                    let line = &mut self.lines[sr];
+                    let bs = char_to_byte_idx(line, sc);
+                    let be = char_to_byte_idx(line, (ec + 1).min(char_count(line)));
+                    line.replace_range(bs..be, "");
+                    self.cursor = (sr, sc);
+                } else {
+                    let first_byte = char_to_byte_idx(&self.lines[sr], sc);
+                    let mut head = self.lines[sr][..first_byte].to_string();
+                    let last_line = &self.lines[er];
+                    let last_byte = char_to_byte_idx(last_line, (ec + 1).min(char_count(last_line)));
+                    let tail = last_line[last_byte..].to_string();
+                    head.push_str(&tail);
+                    self.lines[sr] = head;
+                    // sr+1..=er を削除
+                    self.lines.drain(sr + 1..=er);
+                    self.cursor = (sr, sc);
+                }
+                // カーソル列を行末でクランプ
+                let line_chars = char_count(&self.lines[self.cursor.0]);
+                if self.cursor.1 > 0 && self.cursor.1 >= line_chars {
+                    self.cursor.1 = line_chars.saturating_sub(1);
+                }
+            }
+            _ => return None,
+        }
+        self.mode = EditorMode::Normal;
+        self.visual_anchor = None;
+        Some(captured)
+    }
+
+    // ── 単語境界（vim の word = 英数字+_ の連続） ──
+
+    /// 指定位置の「inner word」(iw) 範囲を返す。
+    /// (col_start, col_end_inclusive) を返す。空行や非単語上では (col, col) を返す。
+    pub fn inner_word_range_at(&self, row: usize, col: usize) -> Option<(usize, usize)> {
+        if row >= self.lines.len() {
+            return None;
+        }
+        let chars: Vec<char> = self.lines[row].chars().collect();
+        if chars.is_empty() {
+            return None;
+        }
+        let col = col.min(chars.len().saturating_sub(1));
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let cur = chars[col];
+        if !is_word(cur) {
+            // 非単語文字の連続
+            let mut s = col;
+            while s > 0 && !is_word(chars[s - 1]) && !chars[s - 1].is_whitespace() {
+                s -= 1;
+            }
+            let mut e = col;
+            while e + 1 < chars.len() && !is_word(chars[e + 1]) && !chars[e + 1].is_whitespace() {
+                e += 1;
+            }
+            // 空白上の場合は単に col のみ
+            if cur.is_whitespace() {
+                let mut s = col;
+                while s > 0 && chars[s - 1].is_whitespace() {
+                    s -= 1;
+                }
+                let mut e = col;
+                while e + 1 < chars.len() && chars[e + 1].is_whitespace() {
+                    e += 1;
+                }
+                return Some((s, e));
+            }
+            return Some((s, e));
+        }
+        // 単語の前方・後方を伸ばす
+        let mut s = col;
+        while s > 0 && is_word(chars[s - 1]) {
+            s -= 1;
+        }
+        let mut e = col;
+        while e + 1 < chars.len() && is_word(chars[e + 1]) {
+            e += 1;
+        }
+        Some((s, e))
+    }
+
+    /// dw / cw / yw 用: カーソル位置から「次の単語の先頭の手前まで」の inclusive な終了列を返す。
+    /// 行末を超える場合は行末を返す。
+    pub fn forward_word_end_col_at(&self, row: usize, col: usize) -> Option<usize> {
+        if row >= self.lines.len() {
+            return None;
+        }
+        let chars: Vec<char> = self.lines[row].chars().collect();
+        if chars.is_empty() || col >= chars.len() {
+            return None;
+        }
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let cur = chars[col];
+        let mut i = col;
+        if cur.is_whitespace() {
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+        } else if is_word(cur) {
+            while i < chars.len() && is_word(chars[i]) {
+                i += 1;
+            }
+            // dw は次単語先頭手前までだが、空白も含めるのが vim の挙動（行内の場合）
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+        } else {
+            // 非単語文字: 同種を進む
+            while i < chars.len() && !is_word(chars[i]) && !chars[i].is_whitespace() {
+                i += 1;
+            }
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+        }
+        // i は次単語の先頭。inclusive 終端は i.saturating_sub(1)
+        Some(i.saturating_sub(1).max(col))
+    }
+
+    // ── オペレータ + モーション ──
+
+    /// dd: 行削除 + ヤンク（既存の delete_line をレジスタ対応に拡張）
+    pub fn delete_line_yank(&mut self) {
+        let row = self.cursor.0;
+        let yanked = format!("{}\n", self.lines[row]);
+        self.register = Some(Register { text: yanked, kind: YankKind::Line });
+        self.delete_line();
+    }
+
+    /// dw: カーソルから次単語先頭の手前まで削除 + ヤンク
+    pub fn delete_word_forward(&mut self) {
+        let (row, col) = self.cursor;
+        let Some(end) = self.forward_word_end_col_at(row, col) else { return };
+        if end < col {
+            return;
+        }
+        self.save_snapshot();
+        let line = &mut self.lines[row];
+        let bs = char_to_byte_idx(line, col);
+        let be = char_to_byte_idx(line, (end + 1).min(char_count(line)));
+        let yanked = line[bs..be].to_string();
+        self.register = Some(Register { text: yanked, kind: YankKind::Char });
+        line.replace_range(bs..be, "");
+        let line_chars = char_count(&self.lines[row]);
+        if self.cursor.1 > 0 && self.cursor.1 >= line_chars {
+            self.cursor.1 = line_chars.saturating_sub(1);
+        }
+    }
+
+    /// diw: 単語まるごと削除 + ヤンク
+    pub fn delete_inner_word(&mut self) {
+        let (row, col) = self.cursor;
+        let Some((s, e)) = self.inner_word_range_at(row, col) else { return };
+        self.save_snapshot();
+        let line = &mut self.lines[row];
+        let bs = char_to_byte_idx(line, s);
+        let be = char_to_byte_idx(line, (e + 1).min(char_count(line)));
+        let yanked = line[bs..be].to_string();
+        self.register = Some(Register { text: yanked, kind: YankKind::Char });
+        line.replace_range(bs..be, "");
+        self.cursor.1 = s;
+        let line_chars = char_count(&self.lines[row]);
+        if self.cursor.1 > 0 && self.cursor.1 >= line_chars {
+            self.cursor.1 = line_chars.saturating_sub(1);
+        }
+    }
+
+    /// cw: dw + Insert
+    pub fn change_word_forward(&mut self) {
+        // cw は実際は ce 相当（末尾空白を含めない）が vim の挙動。
+        let (row, col) = self.cursor;
+        if row >= self.lines.len() { return; }
+        let chars: Vec<char> = self.lines[row].chars().collect();
+        if chars.is_empty() || col >= chars.len() {
+            self.mode = EditorMode::Insert;
+            return;
+        }
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let cur = chars[col];
+        let mut i = col;
+        if is_word(cur) {
+            while i < chars.len() && is_word(chars[i]) { i += 1; }
+        } else if !cur.is_whitespace() {
+            while i < chars.len() && !is_word(chars[i]) && !chars[i].is_whitespace() { i += 1; }
+        } else {
+            while i < chars.len() && chars[i].is_whitespace() { i += 1; }
+        }
+        let end_inclusive = i.saturating_sub(1).max(col);
+        self.save_snapshot();
+        let line = &mut self.lines[row];
+        let bs = char_to_byte_idx(line, col);
+        let be = char_to_byte_idx(line, (end_inclusive + 1).min(char_count(line)));
+        let yanked = line[bs..be].to_string();
+        self.register = Some(Register { text: yanked, kind: YankKind::Char });
+        line.replace_range(bs..be, "");
+        self.mode = EditorMode::Insert;
+    }
+
+    /// ciw: diw + Insert
+    pub fn change_inner_word(&mut self) {
+        let (row, col) = self.cursor;
+        let Some((s, e)) = self.inner_word_range_at(row, col) else {
+            self.mode = EditorMode::Insert;
+            return;
+        };
+        self.save_snapshot();
+        let line = &mut self.lines[row];
+        let bs = char_to_byte_idx(line, s);
+        let be = char_to_byte_idx(line, (e + 1).min(char_count(line)));
+        let yanked = line[bs..be].to_string();
+        self.register = Some(Register { text: yanked, kind: YankKind::Char });
+        line.replace_range(bs..be, "");
+        self.cursor.1 = s;
+        self.mode = EditorMode::Insert;
+    }
+
+    /// yy: 行をヤンク
+    pub fn yank_line(&mut self) {
+        let row = self.cursor.0;
+        let text = format!("{}\n", self.lines[row]);
+        self.register = Some(Register { text, kind: YankKind::Line });
+    }
+
+    /// yw: 次単語先頭手前までヤンク
+    pub fn yank_word_forward(&mut self) {
+        let (row, col) = self.cursor;
+        let Some(end) = self.forward_word_end_col_at(row, col) else { return };
+        if end < col { return; }
+        let line = &self.lines[row];
+        let bs = char_to_byte_idx(line, col);
+        let be = char_to_byte_idx(line, (end + 1).min(char_count(line)));
+        self.register = Some(Register { text: line[bs..be].to_string(), kind: YankKind::Char });
+    }
+
+    /// yiw: 単語まるごとヤンク
+    pub fn yank_inner_word(&mut self) {
+        let (row, col) = self.cursor;
+        let Some((s, e)) = self.inner_word_range_at(row, col) else { return };
+        let line = &self.lines[row];
+        let bs = char_to_byte_idx(line, s);
+        let be = char_to_byte_idx(line, (e + 1).min(char_count(line)));
+        self.register = Some(Register { text: line[bs..be].to_string(), kind: YankKind::Char });
+    }
+
+    /// p: カーソル後ろにペースト（Char）/ 下行にペースト（Line）
+    pub fn paste_after(&mut self) {
+        let Some(reg) = self.register.clone() else { return };
+        self.save_snapshot();
+        match reg.kind {
+            YankKind::Line => {
+                let mut text = reg.text;
+                if text.ends_with('\n') {
+                    text.pop();
+                }
+                let row = self.cursor.0;
+                let new_lines: Vec<String> = text.split('\n').map(String::from).collect();
+                let insert_at = row + 1;
+                for (i, l) in new_lines.iter().enumerate() {
+                    self.lines.insert(insert_at + i, l.clone());
+                }
+                self.cursor = (insert_at, 0);
+            }
+            YankKind::Char => {
+                let (row, col) = self.cursor;
+                let line_chars = char_count(&self.lines[row]);
+                let insert_col = if line_chars == 0 { 0 } else { (col + 1).min(line_chars) };
+                let parts: Vec<&str> = reg.text.split('\n').collect();
+                if parts.len() == 1 {
+                    let bi = char_to_byte_idx(&self.lines[row], insert_col);
+                    self.lines[row].insert_str(bi, parts[0]);
+                    self.cursor = (row, insert_col + parts[0].chars().count().saturating_sub(1).max(0));
+                    if !parts[0].is_empty() {
+                        self.cursor.1 = insert_col + parts[0].chars().count() - 1;
+                    }
+                } else {
+                    let bi = char_to_byte_idx(&self.lines[row], insert_col);
+                    let tail = self.lines[row][bi..].to_string();
+                    self.lines[row].truncate(bi);
+                    self.lines[row].push_str(parts[0]);
+                    for (i, p) in parts[1..].iter().enumerate() {
+                        let line_text = if i == parts.len() - 2 {
+                            let mut s = p.to_string();
+                            s.push_str(&tail);
+                            s
+                        } else {
+                            p.to_string()
+                        };
+                        self.lines.insert(row + 1 + i, line_text);
+                    }
+                    let last_row = row + parts.len() - 1;
+                    let last_inserted_chars = parts.last().unwrap().chars().count();
+                    self.cursor = (last_row, last_inserted_chars.saturating_sub(1));
+                }
+            }
+        }
+    }
+
+    /// P: カーソル前にペースト（Char）/ 上行にペースト（Line）
+    pub fn paste_before(&mut self) {
+        let Some(reg) = self.register.clone() else { return };
+        self.save_snapshot();
+        match reg.kind {
+            YankKind::Line => {
+                let mut text = reg.text;
+                if text.ends_with('\n') { text.pop(); }
+                let row = self.cursor.0;
+                let new_lines: Vec<String> = text.split('\n').map(String::from).collect();
+                for (i, l) in new_lines.iter().enumerate() {
+                    self.lines.insert(row + i, l.clone());
+                }
+                self.cursor = (row, 0);
+            }
+            YankKind::Char => {
+                let (row, col) = self.cursor;
+                let parts: Vec<&str> = reg.text.split('\n').collect();
+                if parts.len() == 1 {
+                    let bi = char_to_byte_idx(&self.lines[row], col);
+                    self.lines[row].insert_str(bi, parts[0]);
+                    if !parts[0].is_empty() {
+                        self.cursor = (row, col + parts[0].chars().count() - 1);
+                    }
+                } else {
+                    let bi = char_to_byte_idx(&self.lines[row], col);
+                    let tail = self.lines[row][bi..].to_string();
+                    self.lines[row].truncate(bi);
+                    self.lines[row].push_str(parts[0]);
+                    for (i, p) in parts[1..].iter().enumerate() {
+                        let line_text = if i == parts.len() - 2 {
+                            let mut s = p.to_string();
+                            s.push_str(&tail);
+                            s
+                        } else {
+                            p.to_string()
+                        };
+                        self.lines.insert(row + 1 + i, line_text);
+                    }
+                    let last_row = row + parts.len() - 1;
+                    let last_inserted_chars = parts.last().unwrap().chars().count();
+                    self.cursor = (last_row, last_inserted_chars.saturating_sub(1));
+                }
+            }
+        }
+    }
+
+    // ── 置換系 ──
+
+    /// r{ch}: カーソル位置の1文字を置換（モード遷移なし）
+    pub fn replace_char(&mut self, ch: char) {
+        let (row, col) = self.cursor;
+        if row >= self.lines.len() { return; }
+        let line_chars = char_count(&self.lines[row]);
+        if col >= line_chars { return; }
+        self.save_snapshot();
+        let line = &mut self.lines[row];
+        let bs = char_to_byte_idx(line, col);
+        let be = char_to_byte_idx(line, col + 1);
+        let mut buf = String::new();
+        buf.push(ch);
+        line.replace_range(bs..be, &buf);
+    }
+
+    /// s: 1文字削除して Insert
+    pub fn substitute_char(&mut self) {
+        let (row, col) = self.cursor;
+        let line_chars = char_count(&self.lines[row]);
+        if col < line_chars {
+            self.save_snapshot();
+            let line = &mut self.lines[row];
+            let bs = char_to_byte_idx(line, col);
+            let be = char_to_byte_idx(line, col + 1);
+            line.replace_range(bs..be, "");
+        }
+        self.mode = EditorMode::Insert;
+    }
+
+    /// S: 行を空にして Insert（インデント保持はしない簡易版）
+    pub fn substitute_line(&mut self) {
+        self.save_snapshot();
+        self.lines[self.cursor.0].clear();
+        self.cursor.1 = 0;
+        self.mode = EditorMode::Insert;
+    }
+
+    /// J: 次行を現在行末に結合（間に半角スペース）
+    pub fn join_lines(&mut self) {
+        if self.cursor.0 + 1 >= self.lines.len() { return; }
+        self.save_snapshot();
+        let row = self.cursor.0;
+        let next = self.lines.remove(row + 1);
+        let cur_chars = char_count(&self.lines[row]);
+        let need_space = !self.lines[row].is_empty() && !next.trim_start().is_empty();
+        let trimmed = next.trim_start();
+        if need_space {
+            self.lines[row].push(' ');
+        }
+        self.lines[row].push_str(trimmed);
+        self.cursor = (row, cur_chars + if need_space { 1 } else { 0 });
+    }
+
+    /// ~: カーソル下の文字の大小を反転し、カーソルを1つ右へ
+    pub fn toggle_case(&mut self) {
+        let (row, col) = self.cursor;
+        let line_chars = char_count(&self.lines[row]);
+        if col >= line_chars { return; }
+        self.save_snapshot();
+        let chars: Vec<char> = self.lines[row].chars().collect();
+        let ch = chars[col];
+        let toggled: String = if ch.is_uppercase() {
+            ch.to_lowercase().collect()
+        } else if ch.is_lowercase() {
+            ch.to_uppercase().collect()
+        } else {
+            ch.to_string()
+        };
+        let bs = char_to_byte_idx(&self.lines[row], col);
+        let be = char_to_byte_idx(&self.lines[row], col + 1);
+        self.lines[row].replace_range(bs..be, &toggled);
+        if col + 1 < char_count(&self.lines[row]) {
+            self.cursor.1 = col + 1;
+        }
+    }
+
+    // ── 検索 ──
+
+    pub fn search_start(&mut self) {
+        self.search.active = true;
+        self.search.query.clear();
+        self.search.matches.clear();
+        self.search.current = 0;
+    }
+
+    pub fn search_cancel(&mut self) {
+        self.search.clear();
+    }
+
+    pub fn search_confirm(&mut self) {
+        self.search.active = false;
+        self.recompute_matches();
+        self.jump_to_match(self.search.current);
+    }
+
+    pub fn search_push_char(&mut self, ch: char) {
+        self.search.query.push(ch);
+        self.recompute_matches();
+    }
+
+    pub fn search_pop_char(&mut self) {
+        self.search.query.pop();
+        self.recompute_matches();
+    }
+
+    /// 現在のクエリでマッチを再計算（小文字での部分一致）
+    pub fn recompute_matches(&mut self) {
+        self.search.matches.clear();
+        self.search.current = 0;
+        if self.search.query.is_empty() {
+            return;
+        }
+        let needle = self.search.query.to_lowercase();
+        let needle_chars = needle.chars().count();
+        for (row, line) in self.lines.iter().enumerate() {
+            let lower = line.to_lowercase();
+            let mut from = 0usize;
+            while let Some(rel) = lower[from..].find(&needle) {
+                let byte_start = from + rel;
+                // バイト位置を文字位置に変換
+                let col_start = lower[..byte_start].chars().count();
+                self.search.matches.push((row, col_start, needle_chars));
+                from = byte_start + needle.len();
+                if from > lower.len() { break; }
+            }
+        }
+        // カーソル位置以降の最初のマッチに current を合わせる
+        let cursor = self.cursor;
+        if let Some((idx, _)) = self
+            .search
+            .matches
+            .iter()
+            .enumerate()
+            .find(|(_, (r, c, _))| (*r, *c) >= cursor)
+        {
+            self.search.current = idx;
+        }
+    }
+
+    pub fn next_match(&mut self) {
+        if self.search.matches.is_empty() { return; }
+        self.search.current = (self.search.current + 1) % self.search.matches.len();
+        self.jump_to_match(self.search.current);
+    }
+
+    pub fn prev_match(&mut self) {
+        if self.search.matches.is_empty() { return; }
+        self.search.current = if self.search.current == 0 {
+            self.search.matches.len() - 1
+        } else {
+            self.search.current - 1
+        };
+        self.jump_to_match(self.search.current);
+    }
+
+    fn jump_to_match(&mut self, idx: usize) {
+        if let Some(&(row, col, _)) = self.search.matches.get(idx) {
+            self.cursor = (row, col);
         }
     }
 
@@ -904,14 +1593,37 @@ pub fn render(f: &mut Frame, editor: &EditorState, is_focused: bool, area: Rect)
         return;
     }
 
-    let line_num_width = format!("{}", editor.lines.len()).len().max(2);
-    let editor_width = (inner.width as usize).saturating_sub(line_num_width + 1); // 1 for "│"
+    // 検索バーを描画する場合は inner の最下行を 1 行確保する
+    let show_search_bar = editor.search.active || !editor.search.query.is_empty();
+    let (content_inner, search_bar_area) = if show_search_bar && inner.height >= 2 {
+        let bar = Rect {
+            x: inner.x,
+            y: inner.y + inner.height - 1,
+            width: inner.width,
+            height: 1,
+        };
+        let content = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: inner.height - 1,
+        };
+        (content, Some(bar))
+    } else {
+        (inner, None)
+    };
 
-    let visible_height = inner.height as usize;
+    let line_num_width = format!("{}", editor.lines.len()).len().max(2);
+    let editor_width = (content_inner.width as usize).saturating_sub(line_num_width + 1); // 1 for "│"
+
+    let visible_height = content_inner.height as usize;
 
     // 表示する行
     let start = editor.scroll_offset;
     let end = (start + visible_height).min(editor.lines.len());
+
+    // 選択範囲（正規化済み）
+    let selection = editor.selection_range();
 
     let mut display_lines: Vec<Line<'static>> = Vec::new();
 
@@ -931,9 +1643,86 @@ pub fn render(f: &mut Frame, editor: &EditorState, is_focused: bool, area: Rect)
             .take(editor_width)
             .collect();
 
-        // シンタックスハイライト（owned Span に変換）
-        for s in highlight_sql(&visible_str) {
-            spans.push(Span::styled(s.content.into_owned(), s.style));
+        // 文字位置 -> 背景色のマップ（可視範囲）
+        let mut bg: Vec<Option<Color>> = vec![None; visible_str.chars().count()];
+
+        // 選択範囲のハイライト
+        if let Some(((sr, sc), (er, ec))) = selection {
+            if i >= sr && i <= er {
+                let (sel_start_col, sel_end_col) = match editor.mode {
+                    EditorMode::VisualLine => (0usize, char_count(line)),
+                    _ => {
+                        let s_col = if i == sr { sc } else { 0 };
+                        let e_col = if i == er { ec + 1 } else { char_count(line) };
+                        (s_col, e_col)
+                    }
+                };
+                let visible_start = sel_start_col.saturating_sub(editor.h_scroll_offset);
+                let visible_end = sel_end_col
+                    .saturating_sub(editor.h_scroll_offset)
+                    .min(bg.len());
+                for k in visible_start..visible_end {
+                    bg[k] = Some(Color::DarkGray);
+                }
+                // 行全体（行末の改行表現）も VisualLine では半マスぶん見せたいが、
+                // ここでは可視文字のみハイライトとする（vim 風の見た目に十分近い）
+            }
+        }
+
+        // 検索マッチのハイライト
+        if !editor.search.query.is_empty() {
+            for &(row, col, len) in &editor.search.matches {
+                if row != i { continue; }
+                let m_start = col.saturating_sub(editor.h_scroll_offset);
+                let m_end = (col + len)
+                    .saturating_sub(editor.h_scroll_offset)
+                    .min(bg.len());
+                for k in m_start..m_end {
+                    bg[k] = Some(Color::Yellow);
+                }
+            }
+        }
+
+        // シンタックスハイライト後、bg を文字単位でマージ
+        let syntax_spans = highlight_sql(&visible_str);
+        let mut char_offset = 0usize;
+        for s in syntax_spans {
+            let content = s.content.into_owned();
+            let nchars = content.chars().count();
+            // bg の連続性で chunk を切る
+            let mut chunk_start = 0usize;
+            let mut current_bg = if char_offset < bg.len() { bg[char_offset] } else { None };
+            let chars: Vec<char> = content.chars().collect();
+            for (k, ch) in chars.iter().enumerate() {
+                let pos = char_offset + k;
+                let here = if pos < bg.len() { bg[pos] } else { None };
+                if here != current_bg {
+                    let chunk: String = chars[chunk_start..k].iter().collect();
+                    let mut style = s.style;
+                    if let Some(c) = current_bg {
+                        style = style.bg(c);
+                        // 背景に黄色を載せたら前景はキーワード色だと見づらいので黒に
+                        if c == Color::Yellow {
+                            style = style.fg(Color::Black);
+                        }
+                    }
+                    spans.push(Span::styled(chunk, style));
+                    chunk_start = k;
+                    current_bg = here;
+                }
+                let _ = ch;
+            }
+            // 最終チャンク
+            let chunk: String = chars[chunk_start..].iter().collect();
+            let mut style = s.style;
+            if let Some(c) = current_bg {
+                style = style.bg(c);
+                if c == Color::Yellow {
+                    style = style.fg(Color::Black);
+                }
+            }
+            spans.push(Span::styled(chunk, style));
+            char_offset += nchars;
         }
 
         display_lines.push(Line::from(spans));
@@ -950,10 +1739,30 @@ pub fn render(f: &mut Frame, editor: &EditorState, is_focused: bool, area: Rect)
     }
 
     let paragraph = Paragraph::new(display_lines);
-    f.render_widget(paragraph, inner);
+    f.render_widget(paragraph, content_inner);
+
+    // 検索バー
+    if let Some(bar) = search_bar_area {
+        let cursor_glyph = if editor.search.active { "█" } else { "" };
+        let prompt_color = if editor.search.active { Color::Yellow } else { Color::DarkGray };
+        let count_label = if editor.search.matches.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}/{}]", editor.search.current + 1, editor.search.matches.len())
+        };
+        let line = Line::from(vec![
+            Span::styled("/", Style::default().fg(prompt_color)),
+            Span::raw(editor.search.query.clone()),
+            Span::styled(cursor_glyph, Style::default().fg(Color::Gray)),
+            Span::styled(count_label, Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(line), bar);
+    }
 
     // カーソル表示（Normal / Insert 両モード）
-    if is_focused && editor.cursor.1 >= editor.h_scroll_offset {
+    // 検索バー入力中はバー側にカーソルを出すので、本文側のカーソルは出さない
+    let inner = content_inner;
+    if is_focused && !editor.search.active && editor.cursor.1 >= editor.h_scroll_offset {
         let cursor_x = inner.x
             + line_num_width as u16
             + 1
@@ -1729,5 +2538,295 @@ mod tests {
         e.cursor = (0, 10);
         ScrollableTrait::h_page_right(&mut e);
         assert_eq!(e.cursor.1, 50);
+    }
+
+    // ── Visual モード ──
+
+    #[test]
+    fn enter_visual_sets_anchor_and_mode() {
+        let mut e = editor_with("SELECT 1");
+        e.cursor = (0, 2);
+        e.enter_visual();
+        assert_eq!(e.mode, EditorMode::Visual);
+        assert_eq!(e.visual_anchor, Some((0, 2)));
+    }
+
+    #[test]
+    fn enter_visual_line_sets_anchor_and_linewise_mode() {
+        let mut e = editor_with("AB\nCD");
+        e.cursor = (1, 1);
+        e.enter_visual_line();
+        assert_eq!(e.mode, EditorMode::VisualLine);
+        assert_eq!(e.visual_anchor, Some((1, 1)));
+    }
+
+    #[test]
+    fn enter_normal_clears_visual_anchor_and_pending() {
+        let mut e = editor_with("AB");
+        e.cursor = (0, 0);
+        e.enter_visual();
+        e.pending_keys.push('d');
+        e.enter_normal();
+        assert_eq!(e.mode, EditorMode::Normal);
+        assert_eq!(e.visual_anchor, None);
+        assert!(e.pending_keys.is_empty());
+    }
+
+    #[test]
+    fn selection_range_normalizes_when_cursor_before_anchor() {
+        let mut e = editor_with("ABCDE");
+        e.cursor = (0, 4);
+        e.enter_visual();
+        e.cursor = (0, 1);
+        let r = e.selection_range().unwrap();
+        assert_eq!(r, ((0, 1), (0, 4)));
+    }
+
+    #[test]
+    fn selection_text_charwise_within_line() {
+        let mut e = editor_with("ABCDE");
+        e.cursor = (0, 1);
+        e.enter_visual();
+        e.cursor = (0, 3);
+        let (text, kind) = e.selection_text().unwrap();
+        assert_eq!(text, "BCD");
+        assert_eq!(kind, YankKind::Char);
+    }
+
+    #[test]
+    fn selection_text_linewise_includes_trailing_newline() {
+        let mut e = editor_with("AB\nCD\nEF");
+        e.cursor = (0, 1);
+        e.enter_visual_line();
+        e.cursor = (1, 0);
+        let (text, kind) = e.selection_text().unwrap();
+        assert_eq!(text, "AB\nCD\n");
+        assert_eq!(kind, YankKind::Line);
+    }
+
+    #[test]
+    fn delete_selection_charwise_within_line_returns_to_normal() {
+        let mut e = editor_with("ABCDE");
+        e.cursor = (0, 1);
+        e.enter_visual();
+        e.cursor = (0, 3);
+        let (text, _) = e.delete_selection().unwrap();
+        assert_eq!(text, "BCD");
+        assert_eq!(e.lines, vec!["AE"]);
+        assert_eq!(e.mode, EditorMode::Normal);
+        assert_eq!(e.visual_anchor, None);
+    }
+
+    #[test]
+    fn delete_selection_linewise_removes_full_lines() {
+        let mut e = editor_with("AA\nBB\nCC\nDD");
+        e.cursor = (1, 0);
+        e.enter_visual_line();
+        e.cursor = (2, 1);
+        e.delete_selection().unwrap();
+        assert_eq!(e.lines, vec!["AA", "DD"]);
+        assert_eq!(e.mode, EditorMode::Normal);
+    }
+
+    #[test]
+    fn swap_visual_anchor_swaps_cursor_and_anchor() {
+        let mut e = editor_with("ABCDE");
+        e.cursor = (0, 1);
+        e.enter_visual();
+        e.cursor = (0, 4);
+        e.swap_visual_anchor();
+        assert_eq!(e.cursor, (0, 1));
+        assert_eq!(e.visual_anchor, Some((0, 4)));
+    }
+
+    // ── 単語境界 ──
+
+    #[test]
+    fn inner_word_range_on_word_extends_both_sides() {
+        let e = editor_with("SELECT id FROM users");
+        let (s, end) = e.inner_word_range_at(0, 8).unwrap();
+        // "id" は col 7..=8
+        assert_eq!((s, end), (7, 8));
+    }
+
+    #[test]
+    fn forward_word_end_col_includes_trailing_whitespace() {
+        let e = editor_with("SELECT id FROM users");
+        // col 0 から dw 相当: "SELECT" + 空白 を消費 → 次単語 'i' の手前 (col 6)
+        let end = e.forward_word_end_col_at(0, 0).unwrap();
+        assert_eq!(end, 6);
+    }
+
+    // ── オペレータ ──
+
+    #[test]
+    fn dw_deletes_word_and_yanks() {
+        let mut e = editor_with("SELECT id FROM users");
+        e.cursor = (0, 0);
+        e.delete_word_forward();
+        assert_eq!(e.lines, vec!["id FROM users"]);
+        assert_eq!(e.register.as_ref().unwrap().text, "SELECT ");
+    }
+
+    #[test]
+    fn diw_deletes_inner_word_keeps_surrounding_spaces() {
+        let mut e = editor_with("SELECT id FROM users");
+        e.cursor = (0, 7); // "id" の上
+        e.delete_inner_word();
+        assert_eq!(e.lines, vec!["SELECT  FROM users"]);
+        assert_eq!(e.register.as_ref().unwrap().text, "id");
+    }
+
+    #[test]
+    fn ciw_deletes_inner_word_and_enters_insert() {
+        let mut e = editor_with("foo bar baz");
+        e.cursor = (0, 5); // "bar"
+        e.change_inner_word();
+        assert_eq!(e.lines, vec!["foo  baz"]);
+        assert_eq!(e.mode, EditorMode::Insert);
+    }
+
+    #[test]
+    fn yy_yanks_line_with_newline() {
+        let mut e = editor_with("hello\nworld");
+        e.cursor = (0, 0);
+        e.yank_line();
+        let r = e.register.as_ref().unwrap();
+        assert_eq!(r.text, "hello\n");
+        assert_eq!(r.kind, YankKind::Line);
+    }
+
+    #[test]
+    fn paste_after_linewise_inserts_below() {
+        let mut e = editor_with("A\nB");
+        e.cursor = (0, 0);
+        e.register = Some(Register { text: "X\n".to_string(), kind: YankKind::Line });
+        e.paste_after();
+        assert_eq!(e.lines, vec!["A", "X", "B"]);
+        assert_eq!(e.cursor, (1, 0));
+    }
+
+    #[test]
+    fn paste_before_linewise_inserts_above() {
+        let mut e = editor_with("A\nB");
+        e.cursor = (1, 0);
+        e.register = Some(Register { text: "X\n".to_string(), kind: YankKind::Line });
+        e.paste_before();
+        assert_eq!(e.lines, vec!["A", "X", "B"]);
+    }
+
+    #[test]
+    fn paste_after_charwise_inserts_after_cursor() {
+        let mut e = editor_with("AB");
+        e.cursor = (0, 0);
+        e.register = Some(Register { text: "XY".to_string(), kind: YankKind::Char });
+        e.paste_after();
+        assert_eq!(e.lines, vec!["AXYB"]);
+    }
+
+    // ── 置換系 ──
+
+    #[test]
+    fn replace_char_keeps_normal_mode() {
+        let mut e = editor_with("ABC");
+        e.cursor = (0, 1);
+        e.replace_char('X');
+        assert_eq!(e.lines, vec!["AXC"]);
+        assert_eq!(e.mode, EditorMode::Normal);
+    }
+
+    #[test]
+    fn substitute_char_deletes_and_enters_insert() {
+        let mut e = editor_with("ABC");
+        e.cursor = (0, 1);
+        e.substitute_char();
+        assert_eq!(e.lines, vec!["AC"]);
+        assert_eq!(e.mode, EditorMode::Insert);
+    }
+
+    #[test]
+    fn substitute_line_clears_and_enters_insert() {
+        let mut e = editor_with("ABC\nDEF");
+        e.cursor = (1, 1);
+        e.substitute_line();
+        assert_eq!(e.lines, vec!["ABC", ""]);
+        assert_eq!(e.cursor, (1, 0));
+        assert_eq!(e.mode, EditorMode::Insert);
+    }
+
+    #[test]
+    fn join_lines_joins_with_space() {
+        let mut e = editor_with("hello\n  world");
+        e.cursor = (0, 0);
+        e.join_lines();
+        assert_eq!(e.lines, vec!["hello world"]);
+    }
+
+    #[test]
+    fn toggle_case_inverts_case_and_advances() {
+        let mut e = editor_with("aB");
+        e.cursor = (0, 0);
+        e.toggle_case();
+        assert_eq!(e.lines, vec!["AB"]);
+        assert_eq!(e.cursor.1, 1);
+    }
+
+    // ── 検索 ──
+
+    #[test]
+    fn search_finds_matches_case_insensitive() {
+        let mut e = editor_with("SELECT id FROM users\nselect name from users");
+        e.search_start();
+        e.search_push_char('s');
+        e.search_push_char('e');
+        e.search_push_char('l');
+        e.search_push_char('e');
+        e.search_push_char('c');
+        e.search_push_char('t');
+        assert_eq!(e.search.matches.len(), 2);
+        assert_eq!(e.search.matches[0], (0, 0, 6));
+        assert_eq!(e.search.matches[1], (1, 0, 6));
+    }
+
+    #[test]
+    fn search_confirm_jumps_to_first_match_after_cursor() {
+        let mut e = editor_with("foo bar foo\nfoo bar");
+        e.cursor = (0, 5);
+        e.search_start();
+        for ch in "foo".chars() {
+            e.search_push_char(ch);
+        }
+        e.search_confirm();
+        // cursor (0,5) 以降の最初のマッチは (0,8)
+        assert_eq!(e.cursor, (0, 8));
+    }
+
+    #[test]
+    fn search_next_and_prev_wrap() {
+        let mut e = editor_with("a x a x a");
+        e.cursor = (0, 0);
+        e.search_start();
+        e.search_push_char('a');
+        e.search_confirm();
+        let first = e.cursor;
+        e.next_match();
+        assert_ne!(e.cursor, first);
+        e.next_match();
+        e.next_match();
+        // 3つマッチ → 元に戻る
+        assert_eq!(e.cursor, first);
+        e.prev_match();
+        assert_ne!(e.cursor, first);
+    }
+
+    #[test]
+    fn search_cancel_clears_state() {
+        let mut e = editor_with("hello");
+        e.search_start();
+        e.search_push_char('h');
+        e.search_cancel();
+        assert!(e.search.query.is_empty());
+        assert!(e.search.matches.is_empty());
+        assert!(!e.search.active);
     }
 }
