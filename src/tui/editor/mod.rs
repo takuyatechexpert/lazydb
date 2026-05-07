@@ -1,17 +1,13 @@
 use crate::tui::scrollable::Scrollable;
-use ratatui::{
-    layout::Rect,
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
-    Frame,
-};
+
+mod render;
+pub use render::render;
 
 // App / Panel は不要: render は EditorState を直接受け取る
 
 // ── SQL キーワード ──
 
-const SQL_KEYWORDS: &[&str] = &[
+pub(super) const SQL_KEYWORDS: &[&str] = &[
     "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "IN", "IS", "NULL", "AS",
     "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "CROSS", "ON", "USING",
     "ORDER", "BY", "ASC", "DESC", "GROUP", "HAVING", "LIMIT", "OFFSET",
@@ -23,6 +19,14 @@ const SQL_KEYWORDS: &[&str] = &[
     "TRUE", "FALSE", "FETCH", "FIRST", "NEXT", "ROWS", "ONLY",
     "BEGIN", "COMMIT", "ROLLBACK", "RETURNING",
 ];
+
+// ── 単語判定ヘルパ ──
+
+/// vim 互換の単語文字判定（英数字 + アンダースコア）
+#[inline]
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
 
 // ── 状態 ──
 
@@ -41,22 +45,38 @@ pub enum YankKind {
     Line,
 }
 
+/// Normal モード中のチョード待機状態。
+/// vim の `r{ch}` / `gg` / `dd dw d{i}w` 系を表現する。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PendingChord {
+    /// チョード待機なし
+    None,
+    /// `r` 押下後、置換文字を待っている
+    Replace,
+    /// `g` 押下後、`gg` の 2 文字目を待っている
+    GotoG,
+    /// `d` / `y` / `c` 押下後、二段目（dd/dw/di...）を待っている
+    Operator(char),
+    /// `di` / `yi` / `ci` 押下後、テキストオブジェクト指定を待っている
+    OperatorInner(char),
+}
+
 #[derive(Debug, Clone)]
 pub struct Register {
-    pub text: String,
-    pub kind: YankKind,
+    pub(crate) text: String,
+    pub(crate) kind: YankKind,
 }
 
 #[derive(Debug, Clone)]
 pub struct Search {
     /// 検索バーで入力中
-    pub active: bool,
+    pub(crate) active: bool,
     /// 確定済みの検索クエリ
-    pub query: String,
+    pub(crate) query: String,
     /// マッチ箇所 (行, 列開始, 長さ)
-    pub matches: Vec<(usize, usize, usize)>,
+    pub(crate) matches: Vec<(usize, usize, usize)>,
     /// 現在の matches インデックス
-    pub current: usize,
+    pub(crate) current: usize,
 }
 
 impl Search {
@@ -146,8 +166,8 @@ pub struct EditorState {
     pub completion: Completion,
     /// Visual モード開始位置 (行, 列)
     pub visual_anchor: Option<(usize, usize)>,
-    /// Normal モード中のチョード待機キー列（"d", "di", "y", "g", "c", "r" 等）
-    pub pending_keys: Vec<char>,
+    /// Normal モード中のチョード待機状態（r/gg/d系/y系/c系）
+    pub pending_chord: PendingChord,
     /// 内部レジスタ（y / d で更新）
     pub register: Option<Register>,
     /// 検索状態
@@ -167,7 +187,7 @@ impl EditorState {
             executing: false,
             completion: Completion::new(),
             visual_anchor: None,
-            pending_keys: Vec::new(),
+            pending_chord: PendingChord::None,
             register: None,
             search: Search::new(),
         }
@@ -222,12 +242,6 @@ impl EditorState {
             self.undo_stack.remove(0);
         }
         self.redo_stack.clear();
-    }
-
-    /// 外部から undo スナップショットを記録するための公開ラッパ。
-    /// Visual モードの一括変換など、複数行の編集前に呼び出して使う。
-    pub fn save_snapshot_pub(&mut self) {
-        self.save_snapshot();
     }
 
     pub fn undo(&mut self) {
@@ -395,7 +409,7 @@ impl EditorState {
         let was_insert = self.mode == EditorMode::Insert;
         self.mode = EditorMode::Normal;
         self.visual_anchor = None;
-        self.pending_keys.clear();
+        self.pending_chord = PendingChord::None;
         // vim の挙動: Insert → Normal でカーソルが1つ左に戻る
         if was_insert {
             let line_chars = char_count(&self.lines[self.cursor.0]);
@@ -411,14 +425,14 @@ impl EditorState {
     pub fn enter_visual(&mut self) {
         self.mode = EditorMode::Visual;
         self.visual_anchor = Some(self.cursor);
-        self.pending_keys.clear();
+        self.pending_chord = PendingChord::None;
     }
 
     /// VisualLine を開始
     pub fn enter_visual_line(&mut self) {
         self.mode = EditorMode::VisualLine;
         self.visual_anchor = Some(self.cursor);
-        self.pending_keys.clear();
+        self.pending_chord = PendingChord::None;
     }
 
     /// Visual 中、anchor とカーソルを入れ替える (o)
@@ -549,6 +563,36 @@ impl EditorState {
         Some(captured)
     }
 
+    /// Visual / VisualLine 選択範囲の大小反転（~）。
+    /// 行ごとに対象列を判定し、各 char を upper⇔lower 切り替え。
+    /// VisualLine では行全体、Visual では (sr,sc)〜(er,ec) inclusive を対象。
+    pub fn toggle_case_selection(&mut self) {
+        let Some(((sr, sc), (er, ec))) = self.selection_range() else { return };
+        let mode = self.mode;
+        self.save_snapshot();
+        for r in sr..=er {
+            let chars: Vec<char> = self.lines[r].chars().collect();
+            let s = if r == sr && mode == EditorMode::Visual { sc } else { 0 };
+            let e = if r == er && mode == EditorMode::Visual {
+                (ec + 1).min(chars.len())
+            } else {
+                chars.len()
+            };
+            let mut new_chars = chars.clone();
+            for k in s..e {
+                let c = new_chars[k];
+                new_chars[k] = if c.is_uppercase() {
+                    c.to_lowercase().next().unwrap_or(c)
+                } else if c.is_lowercase() {
+                    c.to_uppercase().next().unwrap_or(c)
+                } else {
+                    c
+                };
+            }
+            self.lines[r] = new_chars.iter().collect();
+        }
+    }
+
     // ── 単語境界（vim の word = 英数字+_ の連続） ──
 
     /// 指定位置の「inner word」(iw) 範囲を返す。
@@ -562,16 +606,15 @@ impl EditorState {
             return None;
         }
         let col = col.min(chars.len().saturating_sub(1));
-        let is_word = |c: char| c.is_alphanumeric() || c == '_';
         let cur = chars[col];
-        if !is_word(cur) {
+        if !is_word_char(cur) {
             // 非単語文字の連続
             let mut s = col;
-            while s > 0 && !is_word(chars[s - 1]) && !chars[s - 1].is_whitespace() {
+            while s > 0 && !is_word_char(chars[s - 1]) && !chars[s - 1].is_whitespace() {
                 s -= 1;
             }
             let mut e = col;
-            while e + 1 < chars.len() && !is_word(chars[e + 1]) && !chars[e + 1].is_whitespace() {
+            while e + 1 < chars.len() && !is_word_char(chars[e + 1]) && !chars[e + 1].is_whitespace() {
                 e += 1;
             }
             // 空白上の場合は単に col のみ
@@ -590,11 +633,11 @@ impl EditorState {
         }
         // 単語の前方・後方を伸ばす
         let mut s = col;
-        while s > 0 && is_word(chars[s - 1]) {
+        while s > 0 && is_word_char(chars[s - 1]) {
             s -= 1;
         }
         let mut e = col;
-        while e + 1 < chars.len() && is_word(chars[e + 1]) {
+        while e + 1 < chars.len() && is_word_char(chars[e + 1]) {
             e += 1;
         }
         Some((s, e))
@@ -610,15 +653,14 @@ impl EditorState {
         if chars.is_empty() || col >= chars.len() {
             return None;
         }
-        let is_word = |c: char| c.is_alphanumeric() || c == '_';
         let cur = chars[col];
         let mut i = col;
         if cur.is_whitespace() {
             while i < chars.len() && chars[i].is_whitespace() {
                 i += 1;
             }
-        } else if is_word(cur) {
-            while i < chars.len() && is_word(chars[i]) {
+        } else if is_word_char(cur) {
+            while i < chars.len() && is_word_char(chars[i]) {
                 i += 1;
             }
             // dw は次単語先頭手前までだが、空白も含めるのが vim の挙動（行内の場合）
@@ -627,7 +669,7 @@ impl EditorState {
             }
         } else {
             // 非単語文字: 同種を進む
-            while i < chars.len() && !is_word(chars[i]) && !chars[i].is_whitespace() {
+            while i < chars.len() && !is_word_char(chars[i]) && !chars[i].is_whitespace() {
                 i += 1;
             }
             while i < chars.len() && chars[i].is_whitespace() {
@@ -639,6 +681,59 @@ impl EditorState {
     }
 
     // ── オペレータ + モーション ──
+
+    /// `(row, col_start..=col_end)` 範囲のテキストを文字単位レジスタに保存し、
+    /// `delete` が true なら save_snapshot を取って削除し、カーソルを col_start に置く（行末でクランプ）。
+    /// `enter_insert` が true なら最後に Insert モードへ遷移する。
+    /// dw / diw / cw / ciw / yw / yiw の共通実装。
+    fn yank_or_delete_range(
+        &mut self,
+        row: usize,
+        col_start: usize,
+        col_end: usize,
+        delete: bool,
+        enter_insert: bool,
+    ) {
+        let line = &self.lines[row];
+        let bs = char_to_byte_idx(line, col_start);
+        let be = char_to_byte_idx(line, (col_end + 1).min(char_count(line)));
+        let yanked = line[bs..be].to_string();
+        self.register = Some(Register { text: yanked, kind: YankKind::Char });
+        if delete {
+            self.save_snapshot();
+            self.lines[row].replace_range(bs..be, "");
+            self.cursor.1 = col_start;
+            let line_chars = char_count(&self.lines[row]);
+            if self.cursor.1 > 0 && self.cursor.1 >= line_chars {
+                self.cursor.1 = line_chars.saturating_sub(1);
+            }
+        }
+        if enter_insert {
+            self.mode = EditorMode::Insert;
+        }
+    }
+
+    /// cw / ce 用: 末尾空白を含めない単語末尾 inclusive 列を返す（vim の cw = ce 相当の挙動）。
+    pub fn change_word_end_col_at(&self, row: usize, col: usize) -> Option<usize> {
+        if row >= self.lines.len() { return None; }
+        let chars: Vec<char> = self.lines[row].chars().collect();
+        if chars.is_empty() || col >= chars.len() { return None; }
+        let cur = chars[col];
+        let mut i = col;
+        if is_word_char(cur) {
+            while i < chars.len() && is_word_char(chars[i]) { i += 1; }
+        } else if !cur.is_whitespace() {
+            while i < chars.len() && !is_word_char(chars[i]) && !chars[i].is_whitespace() { i += 1; }
+        } else {
+            while i < chars.len() && chars[i].is_whitespace() { i += 1; }
+        }
+        Some(i.saturating_sub(1).max(col))
+    }
+
+    /// 内部レジスタを差し替える。外部から register 直接代入する代わりに使う。
+    pub fn set_register(&mut self, text: String, kind: YankKind) {
+        self.register = Some(Register { text, kind });
+    }
 
     /// dd: 行削除 + ヤンク（既存の delete_line をレジスタ対応に拡張）
     pub fn delete_line_yank(&mut self) {
@@ -652,69 +747,25 @@ impl EditorState {
     pub fn delete_word_forward(&mut self) {
         let (row, col) = self.cursor;
         let Some(end) = self.forward_word_end_col_at(row, col) else { return };
-        if end < col {
-            return;
-        }
-        self.save_snapshot();
-        let line = &mut self.lines[row];
-        let bs = char_to_byte_idx(line, col);
-        let be = char_to_byte_idx(line, (end + 1).min(char_count(line)));
-        let yanked = line[bs..be].to_string();
-        self.register = Some(Register { text: yanked, kind: YankKind::Char });
-        line.replace_range(bs..be, "");
-        let line_chars = char_count(&self.lines[row]);
-        if self.cursor.1 > 0 && self.cursor.1 >= line_chars {
-            self.cursor.1 = line_chars.saturating_sub(1);
-        }
+        if end < col { return; }
+        self.yank_or_delete_range(row, col, end, true, false);
     }
 
     /// diw: 単語まるごと削除 + ヤンク
     pub fn delete_inner_word(&mut self) {
         let (row, col) = self.cursor;
         let Some((s, e)) = self.inner_word_range_at(row, col) else { return };
-        self.save_snapshot();
-        let line = &mut self.lines[row];
-        let bs = char_to_byte_idx(line, s);
-        let be = char_to_byte_idx(line, (e + 1).min(char_count(line)));
-        let yanked = line[bs..be].to_string();
-        self.register = Some(Register { text: yanked, kind: YankKind::Char });
-        line.replace_range(bs..be, "");
-        self.cursor.1 = s;
-        let line_chars = char_count(&self.lines[row]);
-        if self.cursor.1 > 0 && self.cursor.1 >= line_chars {
-            self.cursor.1 = line_chars.saturating_sub(1);
-        }
+        self.yank_or_delete_range(row, s, e, true, false);
     }
 
-    /// cw: dw + Insert
+    /// cw: dw + Insert（末尾空白は含めない = ce 相当）
     pub fn change_word_forward(&mut self) {
-        // cw は実際は ce 相当（末尾空白を含めない）が vim の挙動。
         let (row, col) = self.cursor;
-        if row >= self.lines.len() { return; }
-        let chars: Vec<char> = self.lines[row].chars().collect();
-        if chars.is_empty() || col >= chars.len() {
+        let Some(end) = self.change_word_end_col_at(row, col) else {
             self.mode = EditorMode::Insert;
             return;
-        }
-        let is_word = |c: char| c.is_alphanumeric() || c == '_';
-        let cur = chars[col];
-        let mut i = col;
-        if is_word(cur) {
-            while i < chars.len() && is_word(chars[i]) { i += 1; }
-        } else if !cur.is_whitespace() {
-            while i < chars.len() && !is_word(chars[i]) && !chars[i].is_whitespace() { i += 1; }
-        } else {
-            while i < chars.len() && chars[i].is_whitespace() { i += 1; }
-        }
-        let end_inclusive = i.saturating_sub(1).max(col);
-        self.save_snapshot();
-        let line = &mut self.lines[row];
-        let bs = char_to_byte_idx(line, col);
-        let be = char_to_byte_idx(line, (end_inclusive + 1).min(char_count(line)));
-        let yanked = line[bs..be].to_string();
-        self.register = Some(Register { text: yanked, kind: YankKind::Char });
-        line.replace_range(bs..be, "");
-        self.mode = EditorMode::Insert;
+        };
+        self.yank_or_delete_range(row, col, end, true, true);
     }
 
     /// ciw: diw + Insert
@@ -724,15 +775,7 @@ impl EditorState {
             self.mode = EditorMode::Insert;
             return;
         };
-        self.save_snapshot();
-        let line = &mut self.lines[row];
-        let bs = char_to_byte_idx(line, s);
-        let be = char_to_byte_idx(line, (e + 1).min(char_count(line)));
-        let yanked = line[bs..be].to_string();
-        self.register = Some(Register { text: yanked, kind: YankKind::Char });
-        line.replace_range(bs..be, "");
-        self.cursor.1 = s;
-        self.mode = EditorMode::Insert;
+        self.yank_or_delete_range(row, s, e, true, true);
     }
 
     /// yy: 行をヤンク
@@ -747,20 +790,14 @@ impl EditorState {
         let (row, col) = self.cursor;
         let Some(end) = self.forward_word_end_col_at(row, col) else { return };
         if end < col { return; }
-        let line = &self.lines[row];
-        let bs = char_to_byte_idx(line, col);
-        let be = char_to_byte_idx(line, (end + 1).min(char_count(line)));
-        self.register = Some(Register { text: line[bs..be].to_string(), kind: YankKind::Char });
+        self.yank_or_delete_range(row, col, end, false, false);
     }
 
     /// yiw: 単語まるごとヤンク
     pub fn yank_inner_word(&mut self) {
         let (row, col) = self.cursor;
         let Some((s, e)) = self.inner_word_range_at(row, col) else { return };
-        let line = &self.lines[row];
-        let bs = char_to_byte_idx(line, s);
-        let be = char_to_byte_idx(line, (e + 1).min(char_count(line)));
-        self.register = Some(Register { text: line[bs..be].to_string(), kind: YankKind::Char });
+        self.yank_or_delete_range(row, s, e, false, false);
     }
 
     /// p: カーソル後ろにペースト（Char）/ 下行にペースト（Line）
@@ -785,33 +822,11 @@ impl EditorState {
                 let (row, col) = self.cursor;
                 let line_chars = char_count(&self.lines[row]);
                 let insert_col = if line_chars == 0 { 0 } else { (col + 1).min(line_chars) };
-                let parts: Vec<&str> = reg.text.split('\n').collect();
-                if parts.len() == 1 {
-                    let bi = char_to_byte_idx(&self.lines[row], insert_col);
-                    self.lines[row].insert_str(bi, parts[0]);
-                    self.cursor = (row, insert_col + parts[0].chars().count().saturating_sub(1).max(0));
-                    if !parts[0].is_empty() {
-                        self.cursor.1 = insert_col + parts[0].chars().count() - 1;
-                    }
-                } else {
-                    let bi = char_to_byte_idx(&self.lines[row], insert_col);
-                    let tail = self.lines[row][bi..].to_string();
-                    self.lines[row].truncate(bi);
-                    self.lines[row].push_str(parts[0]);
-                    for (i, p) in parts[1..].iter().enumerate() {
-                        let line_text = if i == parts.len() - 2 {
-                            let mut s = p.to_string();
-                            s.push_str(&tail);
-                            s
-                        } else {
-                            p.to_string()
-                        };
-                        self.lines.insert(row + 1 + i, line_text);
-                    }
-                    let last_row = row + parts.len() - 1;
-                    let last_inserted_chars = parts.last().unwrap().chars().count();
-                    self.cursor = (last_row, last_inserted_chars.saturating_sub(1));
+                // 空 register を p するときは cursor を insert_col に揃える（旧来挙動）
+                if reg.text.is_empty() {
+                    self.cursor = (row, insert_col);
                 }
+                self.paste_chars_at(&reg.text, row, insert_col);
             }
         }
     }
@@ -833,33 +848,40 @@ impl EditorState {
             }
             YankKind::Char => {
                 let (row, col) = self.cursor;
-                let parts: Vec<&str> = reg.text.split('\n').collect();
-                if parts.len() == 1 {
-                    let bi = char_to_byte_idx(&self.lines[row], col);
-                    self.lines[row].insert_str(bi, parts[0]);
-                    if !parts[0].is_empty() {
-                        self.cursor = (row, col + parts[0].chars().count() - 1);
-                    }
-                } else {
-                    let bi = char_to_byte_idx(&self.lines[row], col);
-                    let tail = self.lines[row][bi..].to_string();
-                    self.lines[row].truncate(bi);
-                    self.lines[row].push_str(parts[0]);
-                    for (i, p) in parts[1..].iter().enumerate() {
-                        let line_text = if i == parts.len() - 2 {
-                            let mut s = p.to_string();
-                            s.push_str(&tail);
-                            s
-                        } else {
-                            p.to_string()
-                        };
-                        self.lines.insert(row + 1 + i, line_text);
-                    }
-                    let last_row = row + parts.len() - 1;
-                    let last_inserted_chars = parts.last().unwrap().chars().count();
-                    self.cursor = (last_row, last_inserted_chars.saturating_sub(1));
-                }
+                self.paste_chars_at(&reg.text, row, col);
             }
+        }
+    }
+
+    /// charwise paste の共通実装。
+    /// `text` を `(row, insert_col)` から挿入し、カーソルを末尾に置く。
+    /// 改行を含む場合は途中行を新規行として挿入し、最終行末-1 にカーソルを合わせる。
+    fn paste_chars_at(&mut self, text: &str, row: usize, insert_col: usize) {
+        let parts: Vec<&str> = text.split('\n').collect();
+        if parts.len() == 1 {
+            let bi = char_to_byte_idx(&self.lines[row], insert_col);
+            self.lines[row].insert_str(bi, parts[0]);
+            if !parts[0].is_empty() {
+                self.cursor = (row, insert_col + parts[0].chars().count() - 1);
+            }
+        } else {
+            let bi = char_to_byte_idx(&self.lines[row], insert_col);
+            let tail = self.lines[row][bi..].to_string();
+            self.lines[row].truncate(bi);
+            self.lines[row].push_str(parts[0]);
+            for (i, p) in parts[1..].iter().enumerate() {
+                let line_text = if i == parts.len() - 2 {
+                    let mut s = p.to_string();
+                    s.push_str(&tail);
+                    s
+                } else {
+                    p.to_string()
+                };
+                self.lines.insert(row + 1 + i, line_text);
+            }
+            let last_row = row + parts.len() - 1;
+            let last_inserted_chars = parts.last().unwrap().chars().count();
+            self.cursor = (last_row, last_inserted_chars.saturating_sub(1));
         }
     }
 
@@ -1036,8 +1058,8 @@ impl EditorState {
         if col < len {
             // 現在の文字種をスキップ
             let mut i = col;
-            let is_word = chars[i].is_alphanumeric() || chars[i] == '_';
-            while i < len && ((chars[i].is_alphanumeric() || chars[i] == '_') == is_word) {
+            let is_word = is_word_char(chars[i]);
+            while i < len && (is_word_char(chars[i]) == is_word) {
                 i += 1;
             }
             // 空白スキップ
@@ -1075,8 +1097,8 @@ impl EditorState {
                 i -= 1;
             }
             // 同種の文字をスキップ
-            let is_word = chars[i].is_alphanumeric() || chars[i] == '_';
-            while i > 0 && ((chars[i - 1].is_alphanumeric() || chars[i - 1] == '_') == is_word) {
+            let is_word = is_word_char(chars[i]);
+            while i > 0 && (is_word_char(chars[i - 1]) == is_word) {
                 i -= 1;
             }
             self.cursor.1 = i;
@@ -1101,10 +1123,8 @@ impl EditorState {
             }
             // 同種の文字の末尾へ
             if i < len {
-                let is_word = chars[i].is_alphanumeric() || chars[i] == '_';
-                while i + 1 < len
-                    && ((chars[i + 1].is_alphanumeric() || chars[i + 1] == '_') == is_word)
-                {
+                let is_word = is_word_char(chars[i]);
+                while i + 1 < len && (is_word_char(chars[i + 1]) == is_word) {
                     i += 1;
                 }
                 self.cursor.1 = i;
@@ -1120,10 +1140,8 @@ impl EditorState {
                 i += 1;
             }
             if !next_chars.is_empty() {
-                let is_word = next_chars.get(i).is_some_and(|c| c.is_alphanumeric() || *c == '_');
-                while i + 1 < next_chars.len()
-                    && ((next_chars[i + 1].is_alphanumeric() || next_chars[i + 1] == '_') == is_word)
-                {
+                let is_word = next_chars.get(i).is_some_and(|c| is_word_char(*c));
+                while i + 1 < next_chars.len() && (is_word_char(next_chars[i + 1]) == is_word) {
                     i += 1;
                 }
             }
@@ -1564,375 +1582,6 @@ fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
         .nth(char_idx)
         .map(|(i, _)| i)
         .unwrap_or(s.len())
-}
-
-// ── 描画 ──
-
-pub fn render(f: &mut Frame, editor: &EditorState, is_focused: bool, area: Rect) {
-    let border_style = if is_focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    let title = if editor.executing {
-        " Query Editor [実行中...] "
-    } else {
-        " Query Editor "
-    };
-
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(border_style);
-
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    if inner.width < 4 || inner.height < 1 {
-        return;
-    }
-
-    // 検索バーを描画する場合は inner の最下行を 1 行確保する
-    let show_search_bar = editor.search.active || !editor.search.query.is_empty();
-    let (content_inner, search_bar_area) = if show_search_bar && inner.height >= 2 {
-        let bar = Rect {
-            x: inner.x,
-            y: inner.y + inner.height - 1,
-            width: inner.width,
-            height: 1,
-        };
-        let content = Rect {
-            x: inner.x,
-            y: inner.y,
-            width: inner.width,
-            height: inner.height - 1,
-        };
-        (content, Some(bar))
-    } else {
-        (inner, None)
-    };
-
-    let line_num_width = format!("{}", editor.lines.len()).len().max(2);
-    let editor_width = (content_inner.width as usize).saturating_sub(line_num_width + 1); // 1 for "│"
-
-    let visible_height = content_inner.height as usize;
-
-    // 表示する行
-    let start = editor.scroll_offset;
-    let end = (start + visible_height).min(editor.lines.len());
-
-    // 選択範囲（正規化済み）
-    let selection = editor.selection_range();
-
-    let mut display_lines: Vec<Line<'static>> = Vec::new();
-
-    for i in start..end {
-        let line = &editor.lines[i];
-        let line_num = format!("{:>width$}", i + 1, width = line_num_width);
-
-        let mut spans: Vec<Span<'static>> = vec![
-            Span::styled(line_num, Style::default().fg(Color::DarkGray)),
-            Span::styled("│".to_string(), Style::default().fg(Color::DarkGray)),
-        ];
-
-        // h_scroll を考慮した可視部分
-        let visible_str: String = line
-            .chars()
-            .skip(editor.h_scroll_offset)
-            .take(editor_width)
-            .collect();
-
-        // 文字位置 -> 背景色のマップ（可視範囲）
-        let mut bg: Vec<Option<Color>> = vec![None; visible_str.chars().count()];
-
-        // 選択範囲のハイライト
-        if let Some(((sr, sc), (er, ec))) = selection {
-            if i >= sr && i <= er {
-                let (sel_start_col, sel_end_col) = match editor.mode {
-                    EditorMode::VisualLine => (0usize, char_count(line)),
-                    _ => {
-                        let s_col = if i == sr { sc } else { 0 };
-                        let e_col = if i == er { ec + 1 } else { char_count(line) };
-                        (s_col, e_col)
-                    }
-                };
-                let visible_start = sel_start_col.saturating_sub(editor.h_scroll_offset);
-                let visible_end = sel_end_col
-                    .saturating_sub(editor.h_scroll_offset)
-                    .min(bg.len());
-                for k in visible_start..visible_end {
-                    bg[k] = Some(Color::DarkGray);
-                }
-                // 行全体（行末の改行表現）も VisualLine では半マスぶん見せたいが、
-                // ここでは可視文字のみハイライトとする（vim 風の見た目に十分近い）
-            }
-        }
-
-        // 検索マッチのハイライト
-        if !editor.search.query.is_empty() {
-            for &(row, col, len) in &editor.search.matches {
-                if row != i { continue; }
-                let m_start = col.saturating_sub(editor.h_scroll_offset);
-                let m_end = (col + len)
-                    .saturating_sub(editor.h_scroll_offset)
-                    .min(bg.len());
-                for k in m_start..m_end {
-                    bg[k] = Some(Color::Yellow);
-                }
-            }
-        }
-
-        // シンタックスハイライト後、bg を文字単位でマージ
-        let syntax_spans = highlight_sql(&visible_str);
-        let mut char_offset = 0usize;
-        for s in syntax_spans {
-            let content = s.content.into_owned();
-            let nchars = content.chars().count();
-            // bg の連続性で chunk を切る
-            let mut chunk_start = 0usize;
-            let mut current_bg = if char_offset < bg.len() { bg[char_offset] } else { None };
-            let chars: Vec<char> = content.chars().collect();
-            for (k, ch) in chars.iter().enumerate() {
-                let pos = char_offset + k;
-                let here = if pos < bg.len() { bg[pos] } else { None };
-                if here != current_bg {
-                    let chunk: String = chars[chunk_start..k].iter().collect();
-                    let mut style = s.style;
-                    if let Some(c) = current_bg {
-                        style = style.bg(c);
-                        // 背景に黄色を載せたら前景はキーワード色だと見づらいので黒に
-                        if c == Color::Yellow {
-                            style = style.fg(Color::Black);
-                        }
-                    }
-                    spans.push(Span::styled(chunk, style));
-                    chunk_start = k;
-                    current_bg = here;
-                }
-                let _ = ch;
-            }
-            // 最終チャンク
-            let chunk: String = chars[chunk_start..].iter().collect();
-            let mut style = s.style;
-            if let Some(c) = current_bg {
-                style = style.bg(c);
-                if c == Color::Yellow {
-                    style = style.fg(Color::Black);
-                }
-            }
-            spans.push(Span::styled(chunk, style));
-            char_offset += nchars;
-        }
-
-        display_lines.push(Line::from(spans));
-    }
-
-    // 空行で埋める
-    for _i in end..start + visible_height {
-        let line_num = " ".repeat(line_num_width);
-        display_lines.push(Line::from(vec![
-            Span::styled(line_num, Style::default().fg(Color::DarkGray)),
-            Span::styled("│".to_string(), Style::default().fg(Color::DarkGray)),
-            Span::styled("~".to_string(), Style::default().fg(Color::DarkGray)),
-        ]));
-    }
-
-    let paragraph = Paragraph::new(display_lines);
-    f.render_widget(paragraph, content_inner);
-
-    // 検索バー
-    if let Some(bar) = search_bar_area {
-        let cursor_glyph = if editor.search.active { "█" } else { "" };
-        let prompt_color = if editor.search.active { Color::Yellow } else { Color::DarkGray };
-        let count_label = if editor.search.matches.is_empty() {
-            String::new()
-        } else {
-            format!(" [{}/{}]", editor.search.current + 1, editor.search.matches.len())
-        };
-        let line = Line::from(vec![
-            Span::styled("/", Style::default().fg(prompt_color)),
-            Span::raw(editor.search.query.clone()),
-            Span::styled(cursor_glyph, Style::default().fg(Color::Gray)),
-            Span::styled(count_label, Style::default().fg(Color::DarkGray)),
-        ]);
-        f.render_widget(Paragraph::new(line), bar);
-    }
-
-    // カーソル表示（Normal / Insert 両モード）
-    // 検索バー入力中はバー側にカーソルを出すので、本文側のカーソルは出さない
-    let inner = content_inner;
-    if is_focused && !editor.search.active && editor.cursor.1 >= editor.h_scroll_offset {
-        let cursor_x = inner.x
-            + line_num_width as u16
-            + 1
-            + (editor.cursor.1 - editor.h_scroll_offset) as u16;
-        let cursor_y = inner.y + editor.cursor.0.saturating_sub(editor.scroll_offset) as u16;
-        if cursor_x < inner.x + inner.width && cursor_y < inner.y + inner.height {
-            f.set_cursor_position((cursor_x, cursor_y));
-        }
-    }
-
-    // オートコンプリート プルダウン
-    if is_focused
-        && editor.completion.active
-        && !editor.completion.candidates.is_empty()
-        && editor.cursor.1 >= editor.h_scroll_offset
-    {
-        let cursor_x = inner.x
-            + line_num_width as u16
-            + 1
-            + (editor.cursor.1 - editor.h_scroll_offset) as u16;
-        let cursor_y = inner.y + editor.cursor.0.saturating_sub(editor.scroll_offset) as u16;
-
-        let max_items = editor.completion.candidates.len().min(8);
-        let popup_width = editor
-            .completion
-            .candidates
-            .iter()
-            .map(|c| c.len())
-            .max()
-            .unwrap_or(10)
-            .max(10) as u16
-            + 4;
-
-        // prefix 分だけ左にオフセット
-        let prefix_len = editor.completion.prefix.len() as u16;
-        let popup_x = cursor_x.saturating_sub(prefix_len);
-        let popup_y = cursor_y + 1;
-        let popup_height = max_items as u16 + 2; // ボーダー分
-
-        // 画面内に収まるか確認
-        let frame_area = f.area();
-        if popup_y + popup_height <= frame_area.height
-            && popup_x + popup_width <= frame_area.width
-        {
-            let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
-            f.render_widget(Clear, popup_area);
-
-            let items: Vec<ListItem> = editor
-                .completion
-                .candidates
-                .iter()
-                .enumerate()
-                .take(max_items)
-                .map(|(i, candidate)| {
-                    let style = if i == editor.completion.cursor {
-                        Style::default().bg(Color::Cyan).fg(Color::Black)
-                    } else {
-                        Style::default().fg(Color::White)
-                    };
-                    ListItem::new(Span::styled(format!(" {} ", candidate), style))
-                })
-                .collect();
-
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray));
-            let list = List::new(items).block(block);
-            f.render_widget(list, popup_area);
-        }
-    }
-}
-
-/// SQL シンタックスハイライト（簡易版）
-fn highlight_sql(line: &str) -> Vec<Span<'_>> {
-    let mut spans = Vec::new();
-    let mut chars = line.char_indices().peekable();
-    let mut current_start = 0;
-
-    while let Some(&(i, ch)) = chars.peek() {
-        if ch == '-' {
-            // コメント "--"
-            let rest = &line[i..];
-            if rest.starts_with("--") {
-                if i > current_start {
-                    spans.push(Span::raw(&line[current_start..i]));
-                }
-                spans.push(Span::styled(&line[i..], Style::default().fg(Color::DarkGray)));
-                return spans;
-            }
-            chars.next();
-        } else if ch == '\'' {
-            // 文字列リテラル
-            if i > current_start {
-                spans.push(Span::raw(&line[current_start..i]));
-            }
-            chars.next();
-            let str_start = i;
-            while let Some(&(_j, c)) = chars.peek() {
-                chars.next();
-                if c == '\'' {
-                    break;
-                }
-            }
-            let end = chars.peek().map(|&(j, _)| j).unwrap_or(line.len());
-            let str_end = end.min(line.len());
-            spans.push(Span::styled(
-                &line[str_start..str_end],
-                Style::default().fg(Color::Green),
-            ));
-            current_start = str_end;
-        } else if ch.is_alphabetic() || ch == '_' {
-            // ワード抽出
-            let word_start = i;
-            while let Some(&(_, c)) = chars.peek() {
-                if c.is_alphanumeric() || c == '_' {
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            let word_end = chars.peek().map(|&(j, _)| j).unwrap_or(line.len());
-            let word = &line[word_start..word_end];
-
-            if i > current_start {
-                spans.push(Span::raw(&line[current_start..i]));
-            }
-
-            if SQL_KEYWORDS.iter().any(|kw| kw.eq_ignore_ascii_case(word)) {
-                spans.push(Span::styled(
-                    word,
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ));
-            } else {
-                spans.push(Span::raw(word));
-            }
-            current_start = word_end;
-        } else if ch.is_ascii_digit() {
-            // 数値
-            let num_start = i;
-            while let Some(&(_, c)) = chars.peek() {
-                if c.is_ascii_digit() || c == '.' {
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            let num_end = chars.peek().map(|&(j, _)| j).unwrap_or(line.len());
-
-            if i > current_start {
-                spans.push(Span::raw(&line[current_start..i]));
-            }
-            spans.push(Span::styled(
-                &line[num_start..num_end],
-                Style::default().fg(Color::Yellow),
-            ));
-            current_start = num_end;
-        } else {
-            chars.next();
-        }
-    }
-
-    if current_start < line.len() {
-        spans.push(Span::raw(&line[current_start..]));
-    }
-
-    if spans.is_empty() {
-        spans.push(Span::raw(""));
-    }
-
-    spans
 }
 
 #[cfg(test)]
@@ -2565,11 +2214,11 @@ mod tests {
         let mut e = editor_with("AB");
         e.cursor = (0, 0);
         e.enter_visual();
-        e.pending_keys.push('d');
+        e.pending_chord = PendingChord::Operator('d');
         e.enter_normal();
         assert_eq!(e.mode, EditorMode::Normal);
         assert_eq!(e.visual_anchor, None);
-        assert!(e.pending_keys.is_empty());
+        assert_eq!(e.pending_chord, PendingChord::None);
     }
 
     #[test]

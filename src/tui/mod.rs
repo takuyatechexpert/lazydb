@@ -353,6 +353,21 @@ pub struct App {
 }
 
 impl App {
+    /// OS クリップボードへコピー。成功なら Ok、失敗なら arboard のエラーを返す。
+    /// fire-and-forget したい場合は `let _ = App::copy_to_clipboard(...)`、
+    /// ステータスに反映したい場合は `match App::copy_to_clipboard(...)` で扱う。
+    fn copy_to_clipboard(text: &str) -> Result<(), arboard::Error> {
+        arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text.to_string()))
+    }
+
+    /// `text` を OS クリップボードに転送し、同時に内部レジスタにも保存する。
+    /// Visual モードの y/d/c などで「クリップボード反映＋register 更新」を必ずセットで行うための共通ヘルパ。
+    fn yank_to_register_and_clipboard(&mut self, text: String, kind: editor::YankKind) {
+        let _ = App::copy_to_clipboard(&text);
+        let idx = self.active_tab;
+        self.tabs[idx].editor.set_register(text, kind);
+    }
+
     pub fn new(connections: Vec<ConnectionConfig>, config: AppConfig, tx: mpsc::Sender<AppEvent>) -> Self {
         Self {
             mode: AppMode::ConnectionPicker,
@@ -924,7 +939,7 @@ impl App {
             }
             KeyCode::Char('y') => {
                 if let Some(name) = self.schema.current_table_name() {
-                    match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&name)) {
+                    match App::copy_to_clipboard(&name) {
                         Ok(_) => {
                             self.status_message = Some(format!("コピー: {}", name));
                         }
@@ -993,9 +1008,9 @@ impl App {
     fn handle_editor_normal_key(&mut self, key: KeyEvent) {
         let idx = self.active_tab;
         // 保留中のチョード（r/g/d/c/y/di/ci/yi）を最優先で処理
-        let pending = self.tabs[idx].editor.pending_keys.clone();
-        if !pending.is_empty() {
-            self.handle_editor_normal_chord(&pending, key);
+        let pending = self.tabs[idx].editor.pending_chord;
+        if pending != editor::PendingChord::None {
+            self.handle_editor_normal_chord(pending, key);
             return;
         }
 
@@ -1004,7 +1019,7 @@ impl App {
         // → g/G は dispatch 任せだと gg のチョードが扱えないため、g 単独だけ手前で捕まえる。
         if let KeyCode::Char('g') = key.code {
             if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                self.tabs[idx].editor.pending_keys.push('g');
+                self.tabs[idx].editor.pending_chord = editor::PendingChord::GotoG;
                 return;
             }
         }
@@ -1037,10 +1052,10 @@ impl App {
             KeyCode::Char('p') => self.tabs[idx].editor.paste_after(),
             KeyCode::Char('P') => self.tabs[idx].editor.paste_before(),
             // チョード開始
-            KeyCode::Char('d') => self.tabs[idx].editor.pending_keys.push('d'),
-            KeyCode::Char('y') => self.tabs[idx].editor.pending_keys.push('y'),
-            KeyCode::Char('c') => self.tabs[idx].editor.pending_keys.push('c'),
-            KeyCode::Char('r') => self.tabs[idx].editor.pending_keys.push('r'),
+            KeyCode::Char('d') => self.tabs[idx].editor.pending_chord = editor::PendingChord::Operator('d'),
+            KeyCode::Char('y') => self.tabs[idx].editor.pending_chord = editor::PendingChord::Operator('y'),
+            KeyCode::Char('c') => self.tabs[idx].editor.pending_chord = editor::PendingChord::Operator('c'),
+            KeyCode::Char('r') => self.tabs[idx].editor.pending_chord = editor::PendingChord::Replace,
             // 単発の大文字オペレータ
             KeyCode::Char('D') => self.tabs[idx].editor.delete_to_end(),
             KeyCode::Char('C') => self.tabs[idx].editor.change_to_end(),
@@ -1078,94 +1093,78 @@ impl App {
             }
             KeyCode::Esc => {
                 // 保留中のチョードをキャンセル
-                self.tabs[idx].editor.pending_keys.clear();
+                self.tabs[idx].editor.pending_chord = editor::PendingChord::None;
             }
             _ => {}
         }
     }
 
-    /// pending_keys に文字が積まれている状態で次のキーを処理する。
-    /// 完了したら pending_keys をクリアする。
-    fn handle_editor_normal_chord(&mut self, pending: &[char], key: KeyEvent) {
+    /// PendingChord 状態で次のキーを処理する。完了したらチョードを None にクリアする。
+    fn handle_editor_normal_chord(&mut self, pending: editor::PendingChord, key: KeyEvent) {
         let idx = self.active_tab;
         let editor = &mut self.tabs[idx].editor;
 
-        // r{char}: 1文字置換
-        if pending == ['r'] {
-            if let KeyCode::Char(ch) = key.code {
-                editor.replace_char(ch);
+        match pending {
+            editor::PendingChord::None => {}
+            // r{char}: 1文字置換
+            editor::PendingChord::Replace => {
+                if let KeyCode::Char(ch) = key.code {
+                    editor.replace_char(ch);
+                }
+                editor.pending_chord = editor::PendingChord::None;
             }
-            editor.pending_keys.clear();
-            return;
-        }
-
-        // gg
-        if pending == ['g'] {
-            match key.code {
-                KeyCode::Char('g') => editor.move_to_top(),
-                _ => {}
+            // gg
+            editor::PendingChord::GotoG => {
+                if let KeyCode::Char('g') = key.code {
+                    editor.move_to_top();
+                }
+                editor.pending_chord = editor::PendingChord::None;
             }
-            editor.pending_keys.clear();
-            return;
-        }
-
-        // d / y / c の 2 段目
-        if pending.len() == 1 && matches!(pending[0], 'd' | 'y' | 'c') {
-            let op = pending[0];
-            match key.code {
-                KeyCode::Char(c) if c == op => {
-                    // dd / yy / cc
-                    match op {
-                        'd' => editor.delete_line_yank(),
-                        'y' => editor.yank_line(),
-                        'c' => editor.substitute_line(),
-                        _ => {}
-                    }
-                    editor.pending_keys.clear();
-                    if op == 'y' {
-                        // yy 後は内部レジスタの内容をクリップボードにも反映
-                        if let Some(reg) = editor.register.clone() {
-                            let _ = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(reg.text));
+            // d / y / c の 2 段目
+            editor::PendingChord::Operator(op) => {
+                match key.code {
+                    KeyCode::Char(c) if c == op => {
+                        // dd / yy / cc
+                        match op {
+                            'd' => editor.delete_line_yank(),
+                            'y' => editor.yank_line(),
+                            'c' => editor.substitute_line(),
+                            _ => {}
+                        }
+                        editor.pending_chord = editor::PendingChord::None;
+                        if op == 'y' {
+                            // yy 後は内部レジスタの内容をクリップボードにも反映
+                            if let Some(reg) = editor.register.clone() {
+                                let _ = App::copy_to_clipboard(&reg.text);
+                            }
                         }
                     }
-                    return;
-                }
-                KeyCode::Char('w') => {
-                    match op {
-                        'd' => editor.delete_word_forward(),
-                        'y' => editor.yank_word_forward(),
-                        'c' => editor.change_word_forward(),
-                        _ => {}
-                    }
-                    editor.pending_keys.clear();
-                    if op == 'y' {
-                        if let Some(reg) = editor.register.clone() {
-                            let _ = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(reg.text));
+                    KeyCode::Char('w') => {
+                        match op {
+                            'd' => editor.delete_word_forward(),
+                            'y' => editor.yank_word_forward(),
+                            'c' => editor.change_word_forward(),
+                            _ => {}
+                        }
+                        editor.pending_chord = editor::PendingChord::None;
+                        if op == 'y' {
+                            if let Some(reg) = editor.register.clone() {
+                                let _ = App::copy_to_clipboard(&reg.text);
+                            }
                         }
                     }
-                    return;
-                }
-                KeyCode::Char('i') => {
-                    editor.pending_keys.push('i');
-                    return;
-                }
-                KeyCode::Esc => {
-                    editor.pending_keys.clear();
-                    return;
-                }
-                _ => {
-                    // 不明なキーはチョードをキャンセル
-                    editor.pending_keys.clear();
-                    return;
+                    KeyCode::Char('i') => {
+                        editor.pending_chord = editor::PendingChord::OperatorInner(op);
+                    }
+                    _ => {
+                        // Esc 含めて不明なキーはチョードをキャンセル
+                        editor.pending_chord = editor::PendingChord::None;
+                    }
                 }
             }
-        }
-
-        // di / yi / ci の 3 段目（テキストオブジェクト）
-        if pending.len() == 2 && pending[1] == 'i' && matches!(pending[0], 'd' | 'y' | 'c') {
-            let op = pending[0];
-            match key.code {
-                KeyCode::Char('w') => {
+            // di / yi / ci の 3 段目（テキストオブジェクト）
+            editor::PendingChord::OperatorInner(op) => {
+                if let KeyCode::Char('w') = key.code {
                     match op {
                         'd' => editor.delete_inner_word(),
                         'y' => editor.yank_inner_word(),
@@ -1174,18 +1173,13 @@ impl App {
                     }
                     if op == 'y' {
                         if let Some(reg) = editor.register.clone() {
-                            let _ = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(reg.text));
+                            let _ = App::copy_to_clipboard(&reg.text);
                         }
                     }
                 }
-                _ => {}
+                editor.pending_chord = editor::PendingChord::None;
             }
-            editor.pending_keys.clear();
-            return;
         }
-
-        // 想定外
-        editor.pending_keys.clear();
     }
 
     /// Visual / VisualLine モードのキーハンドラ。
@@ -1223,8 +1217,7 @@ impl App {
             // ヤンク
             KeyCode::Char('y') => {
                 if let Some((text, kind)) = self.tabs[idx].editor.selection_text() {
-                    self.tabs[idx].editor.register = Some(editor::Register { text: text.clone(), kind });
-                    let _ = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text));
+                    self.yank_to_register_and_clipboard(text, kind);
                     self.status_message = Some("選択範囲をコピーしました".to_string());
                 }
                 self.tabs[idx].editor.enter_normal();
@@ -1232,15 +1225,13 @@ impl App {
             // 削除
             KeyCode::Char('d') | KeyCode::Char('x') => {
                 if let Some((text, kind)) = self.tabs[idx].editor.delete_selection() {
-                    self.tabs[idx].editor.register = Some(editor::Register { text: text.clone(), kind });
-                    let _ = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text));
+                    self.yank_to_register_and_clipboard(text, kind);
                 }
             }
             // 削除して Insert
             KeyCode::Char('c') => {
                 if let Some((text, kind)) = self.tabs[idx].editor.delete_selection() {
-                    self.tabs[idx].editor.register = Some(editor::Register { text: text.clone(), kind });
-                    let _ = arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text));
+                    self.yank_to_register_and_clipboard(text, kind);
                 }
                 self.tabs[idx].editor.mode = editor::EditorMode::Insert;
             }
@@ -1253,33 +1244,7 @@ impl App {
             }
             // 大小反転
             KeyCode::Char('~') => {
-                if let Some(((sr, sc), (er, ec))) = self.tabs[idx].editor.selection_range() {
-                    let mode = self.tabs[idx].editor.mode;
-                    self.tabs[idx].editor.save_snapshot_pub();
-                    let editor = &mut self.tabs[idx].editor;
-                    for r in sr..=er {
-                        let line = &editor.lines[r];
-                        let chars: Vec<char> = line.chars().collect();
-                        let s = if r == sr && mode == editor::EditorMode::Visual { sc } else { 0 };
-                        let e = if r == er && mode == editor::EditorMode::Visual {
-                            (ec + 1).min(chars.len())
-                        } else {
-                            chars.len()
-                        };
-                        let mut new_chars = chars.clone();
-                        for k in s..e {
-                            let c = new_chars[k];
-                            new_chars[k] = if c.is_uppercase() {
-                                c.to_lowercase().next().unwrap_or(c)
-                            } else if c.is_lowercase() {
-                                c.to_uppercase().next().unwrap_or(c)
-                            } else {
-                                c
-                            };
-                        }
-                        editor.lines[r] = new_chars.iter().collect();
-                    }
-                }
+                self.tabs[idx].editor.toggle_case_selection();
                 self.tabs[idx].editor.enter_normal();
             }
             _ => {}
@@ -1370,7 +1335,7 @@ impl App {
             }
             KeyCode::Char('y') => {
                 if let Some(csv) = self.tabs[idx].results.copy_current_row() {
-                    match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&csv)) {
+                    match App::copy_to_clipboard(&csv) {
                         Ok(_) => {
                             self.status_message = Some("行データをコピーしました".to_string());
                         }
