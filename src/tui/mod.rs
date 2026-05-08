@@ -18,7 +18,9 @@ use crate::history::{HistoryEntry, HistoryStore};
 use crate::tunnel::Tunnel;
 use anyhow::Result;
 use crossterm::{
-    event::{Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -310,6 +312,7 @@ pub struct ActiveConnectionInfo {
 
 pub enum AppEvent {
     Key(KeyEvent),
+    Paste(String),
     Tick,
     TunnelReady(Box<(Result<Tunnel>, ConnectionConfig)>),
     TablesLoaded(Result<Vec<TableInfo>>),
@@ -452,6 +455,7 @@ impl App {
     pub fn handle_event(&mut self, event: AppEvent) -> std::ops::ControlFlow<()> {
         match event {
             AppEvent::Key(key) => self.handle_key(key),
+            AppEvent::Paste(text) => self.handle_paste(text),
             AppEvent::Tick => {
                 self.schema.tick();
                 let idx = self.active_tab;
@@ -619,6 +623,26 @@ impl App {
             self.resolved_password.clone(),
             self.tx.clone(),
         );
+    }
+
+    fn handle_paste(&mut self, text: String) -> std::ops::ControlFlow<()> {
+        // ペーストはエディタペインがアクティブな時のみ受け付ける
+        if !matches!(self.mode, AppMode::Normal) {
+            return std::ops::ControlFlow::Continue(());
+        }
+        if self.active_panel != Panel::Editor {
+            return std::ops::ControlFlow::Continue(());
+        }
+        let idx = self.active_tab;
+        // 補完ポップアップは閉じる（ペースト挿入と相性が悪いため）
+        self.tabs[idx].editor.completion.close();
+        // Insert モードへ遷移してから一括挿入する
+        if self.tabs[idx].editor.mode != editor::EditorMode::Insert {
+            self.tabs[idx].editor.enter_insert();
+        }
+        self.tabs[idx].editor.insert_str(&text);
+        self.update_editor_completion();
+        std::ops::ControlFlow::Continue(())
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> std::ops::ControlFlow<()> {
@@ -2050,14 +2074,14 @@ pub async fn run(connections: Vec<ConnectionConfig>, config: AppConfig, initial_
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let _ = crossterm::terminal::disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
         original_hook(panic_info);
     }));
 
     // ターミナルセットアップ
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.hide_cursor()?;
@@ -2124,6 +2148,11 @@ pub async fn run(connections: Vec<ConnectionConfig>, config: AppConfig, initial_
                         break;
                     }
                 }
+                Ok(Some(Event::Paste(text))) => {
+                    if key_tx.send(AppEvent::Paste(text)).await.is_err() {
+                        break;
+                    }
+                }
                 Ok(Some(_)) => {} // マウスイベント等は無視
                 Ok(None) => {
                     // タイムアウト: チャネルが閉じていたら終了
@@ -2187,6 +2216,7 @@ pub async fn run(connections: Vec<ConnectionConfig>, config: AppConfig, initial_
     crossterm::terminal::disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         LeaveAlternateScreen,
         crossterm::cursor::Show
     )?;

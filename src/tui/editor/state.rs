@@ -123,6 +123,40 @@ impl EditorState {
         }
     }
 
+    /// 複数行を含む文字列を一括挿入する（ペースト用）。
+    /// `\r\n` / `\r` / `\n` を改行として扱い、それ以外は通常文字として挿入する。
+    /// snapshot は冒頭で 1 回だけ取り、undo を 1 アクションにまとめる。
+    pub fn insert_str(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        self.save_snapshot();
+        let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
+        let mut first = true;
+        for segment in normalized.split('\n') {
+            if !first {
+                let (row, col) = self.cursor;
+                if row < self.lines.len() {
+                    let byte_idx = char_to_byte_idx(&self.lines[row], col);
+                    let rest = self.lines[row][byte_idx..].to_string();
+                    self.lines[row].truncate(byte_idx);
+                    self.lines.insert(row + 1, rest);
+                    self.cursor = (row + 1, 0);
+                }
+            }
+            for ch in segment.chars() {
+                let (row, col) = self.cursor;
+                if row < self.lines.len() {
+                    let line = &mut self.lines[row];
+                    let byte_idx = char_to_byte_idx(line, col);
+                    line.insert(byte_idx, ch);
+                    self.cursor.1 += 1;
+                }
+            }
+            first = false;
+        }
+    }
+
     pub fn backspace(&mut self) {
         let (row, col) = self.cursor;
         if col > 0 {
