@@ -32,9 +32,9 @@ impl EditorState {
                 chars.len()
             };
             let mut new_chars = chars.clone();
-            for k in s..e {
-                let c = new_chars[k];
-                new_chars[k] = if c.is_uppercase() {
+            for c_ref in &mut new_chars[s..e] {
+                let c = *c_ref;
+                *c_ref = if c.is_uppercase() {
                     c.to_lowercase().next().unwrap_or(c)
                 } else if c.is_lowercase() {
                     c.to_uppercase().next().unwrap_or(c)

@@ -459,7 +459,7 @@ impl EditorState {
             self.cursor.1 = 0;
         }
         let line_chars = char_count(&self.lines[self.cursor.0]);
-        self.cursor.1 = self.cursor.1.min(line_chars.saturating_sub(1).max(0));
+        self.cursor.1 = self.cursor.1.min(line_chars.saturating_sub(1));
     }
 
     // delete_to_end / change_to_end は operators.rs に分離

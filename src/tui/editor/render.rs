@@ -149,8 +149,8 @@ fn render_content_lines(
                 let visible_end = sel_end_col
                     .saturating_sub(editor.h_scroll_offset)
                     .min(bg.len());
-                for k in visible_start..visible_end {
-                    bg[k] = Some(Color::DarkGray);
+                for slot in &mut bg[visible_start..visible_end] {
+                    *slot = Some(Color::DarkGray);
                 }
             }
         }
@@ -163,8 +163,8 @@ fn render_content_lines(
                 let m_end = (col + len)
                     .saturating_sub(editor.h_scroll_offset)
                     .min(bg.len());
-                for k in m_start..m_end {
-                    bg[k] = Some(Color::Yellow);
+                for slot in &mut bg[m_start..m_end] {
+                    *slot = Some(Color::Yellow);
                 }
             }
         }

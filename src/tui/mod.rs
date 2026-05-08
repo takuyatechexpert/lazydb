@@ -703,10 +703,8 @@ impl App {
                     }
                 }
             }
-            KeyCode::Esc => {
-                if self.active_connection.is_some() {
-                    self.mode = AppMode::Normal;
-                }
+            KeyCode::Esc if self.active_connection.is_some() => {
+                self.mode = AppMode::Normal;
             }
             _ => {}
         }
@@ -841,8 +839,11 @@ impl App {
                 self.active_panel = self.active_panel.prev();
                 self.tabs[self.active_tab].pending_c = false;
             }
-            KeyCode::Char('?') if !(self.active_panel == Panel::Editor && self.tabs[idx].editor.mode == editor::EditorMode::Insert)
-                && !(self.active_panel == Panel::Editor && self.tabs[idx].editor.search.active) => {
+            KeyCode::Char('?')
+                if self.active_panel != Panel::Editor
+                    || (self.tabs[idx].editor.mode != editor::EditorMode::Insert
+                        && !self.tabs[idx].editor.search.active) =>
+            {
                 self.mode = AppMode::Help;
             }
             _ => {
@@ -1414,11 +1415,11 @@ impl App {
                     }
                 }
             }
-            KeyCode::Backspace => {
-                if self.new_conn_form.cursor >= 2 && !self.new_conn_form.is_current_bool_toggle() {
-                    if let Some(val) = self.new_conn_form.current_field_mut() {
-                        val.pop();
-                    }
+            KeyCode::Backspace
+                if self.new_conn_form.cursor >= 2 && !self.new_conn_form.is_current_bool_toggle() =>
+            {
+                if let Some(val) = self.new_conn_form.current_field_mut() {
+                    val.pop();
                 }
             }
             KeyCode::Left => {
@@ -1662,19 +1663,15 @@ impl App {
             KeyCode::Esc => {
                 self.mode = AppMode::Normal;
             }
-            KeyCode::Down | KeyCode::Tab => {
-                if !self.history_entries.is_empty() {
-                    self.history_cursor = (self.history_cursor + 1) % self.history_entries.len();
-                }
+            KeyCode::Down | KeyCode::Tab if !self.history_entries.is_empty() => {
+                self.history_cursor = (self.history_cursor + 1) % self.history_entries.len();
             }
-            KeyCode::Up | KeyCode::BackTab => {
-                if !self.history_entries.is_empty() {
-                    self.history_cursor = if self.history_cursor == 0 {
-                        self.history_entries.len() - 1
-                    } else {
-                        self.history_cursor - 1
-                    };
-                }
+            KeyCode::Up | KeyCode::BackTab if !self.history_entries.is_empty() => {
+                self.history_cursor = if self.history_cursor == 0 {
+                    self.history_entries.len() - 1
+                } else {
+                    self.history_cursor - 1
+                };
             }
             KeyCode::Enter => {
                 if let Some(entry) = self.history_entries.get(self.history_cursor) {
