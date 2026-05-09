@@ -462,6 +462,9 @@ pub struct App {
     pub resolved_password: Option<String>,
     /// vim の `zz` 2 連打検出: 直前のキーが（フォーカス中ペインで）`z` だったときだけ true
     pub pending_z: bool,
+    /// ヘルプポップアップの縦スクロールオフセット。
+    /// `?` で開くたびに 0 にリセットされ、ポップアップ内の j/k/PgDn/g などで操作する。
+    pub help_scroll: u16,
 }
 
 impl App {
@@ -506,6 +509,7 @@ impl App {
             new_conn_form: NewConnectionForm::new(),
             resolved_password: None,
             pending_z: false,
+            help_scroll: 0,
         }
     }
 
@@ -863,9 +867,33 @@ impl App {
     }
 
     fn handle_help_key(&mut self, key: KeyEvent) -> std::ops::ControlFlow<()> {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
+        // ヘルプ本文は help::total_lines() で総行数が分かる。
+        // 表示行数（ポップアップ内側高さ）はターミナル依存だが、
+        // 上限は描画時に再クランプされるので、ここでは total_lines を上限として扱えば安全。
+        let total = help::total_lines();
+        let page: u16 = 10;
+        match (key.code, key.modifiers.contains(KeyModifiers::CONTROL)) {
+            (KeyCode::Esc, _) | (KeyCode::Char('?'), false) | (KeyCode::Char('q'), false) => {
                 self.mode = AppMode::Normal;
+                self.help_scroll = 0;
+            }
+            (KeyCode::Char('j'), false) | (KeyCode::Down, _) => {
+                self.help_scroll = self.help_scroll.saturating_add(1).min(total);
+            }
+            (KeyCode::Char('k'), false) | (KeyCode::Up, _) => {
+                self.help_scroll = self.help_scroll.saturating_sub(1);
+            }
+            (KeyCode::PageDown, _) | (KeyCode::Char('d'), true) => {
+                self.help_scroll = self.help_scroll.saturating_add(page).min(total);
+            }
+            (KeyCode::PageUp, _) | (KeyCode::Char('u'), true) => {
+                self.help_scroll = self.help_scroll.saturating_sub(page);
+            }
+            (KeyCode::Char('g'), false) => {
+                self.help_scroll = 0;
+            }
+            (KeyCode::Char('G'), false) => {
+                self.help_scroll = total;
             }
             _ => {}
         }
@@ -996,6 +1024,7 @@ impl App {
                         && !self.tabs[idx].editor.search.active) =>
             {
                 self.mode = AppMode::Help;
+                self.help_scroll = 0;
             }
             _ => {
                 match self.active_panel {
@@ -2094,7 +2123,7 @@ fn spawn_execute_query(
 
 // ── 描画 ──
 
-fn render(f: &mut Frame, app: &App) {
+fn render(f: &mut Frame, app: &mut App) {
     let size = f.area();
 
     // ヘッダー（1行）+ メインエリア + フッター（1行）
@@ -2118,7 +2147,7 @@ fn render(f: &mut Frame, app: &App) {
         AppMode::HistoryPicker => picker::render_history(f, app, size),
         AppMode::ExportFormatPicker => picker::render_export_format(f, app, size),
         AppMode::ExportPathInput => picker::render_export_path(f, app, size),
-        AppMode::Help => help::render(f, size),
+        AppMode::Help => help::render(f, size, &mut app.help_scroll),
         _ => {}
     }
 }
@@ -2356,7 +2385,7 @@ pub async fn run(connections: Vec<ConnectionConfig>, config: AppConfig, initial_
         // Results パネルの表示幅を更新（右70% - ボーダー2）
         app.tabs[idx].results.visible_width = (term_width * 70 / 100).saturating_sub(2);
 
-        terminal.draw(|f| render(f, &app))?;
+        terminal.draw(|f| render(f, &mut app))?;
 
         if let Some(event) = rx.recv().await {
             if app.handle_event(event).is_break() {
