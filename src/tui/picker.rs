@@ -101,6 +101,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             Span::raw("移動  "),
             Span::styled("Enter ", Style::default().fg(Color::Cyan)),
             Span::raw("選択  "),
+            Span::styled("e ", Style::default().fg(Color::Cyan)),
+            Span::raw("編集  "),
+            Span::styled("d ", Style::default().fg(Color::Cyan)),
+            Span::raw("複製  "),
             Span::styled("Esc ", Style::default().fg(Color::Cyan)),
             Span::raw("閉じる"),
         ]))
@@ -307,7 +311,8 @@ pub fn render_new_connection(f: &mut Frame, app: &App, area: Rect) {
     let popup = centered_rect(55, 75, area);
     f.render_widget(Clear, popup);
 
-    let title = format!(" New Connection ({} / {}) ",
+    let title = format!(" {} ({} / {}) ",
+        app.new_conn_form.form_mode.title(),
         app.new_conn_form.conn_type.label(),
         app.new_conn_form.db_type.label(),
     );

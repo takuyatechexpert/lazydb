@@ -95,6 +95,16 @@ impl ConnectionConfig {
         }
     }
 
+    /// 設定ファイル上の password フィールドの生の値を返す（解決前）。
+    /// 編集モードで password 入力が空のときに既存値を維持するために使う。
+    pub fn password_field(&self) -> Option<&str> {
+        match self {
+            ConnectionConfig::Direct(c) => c.password.as_deref(),
+            ConnectionConfig::Ssh(c) => c.password.as_deref(),
+            ConnectionConfig::Ssm(c) => c.password.as_deref(),
+        }
+    }
+
     /// パスワードを解決して返す
     pub fn resolve_password(&self) -> Result<Option<String>> {
         let raw = match self {
@@ -195,6 +205,40 @@ pub fn load_connections(config_path: Option<&str>) -> Result<Vec<ConnectionConfi
         .with_context(|| format!("接続設定ファイルのパースに失敗しました: {}", path.display()))?;
 
     Ok(connections)
+}
+
+/// 接続設定リストを connections.yml に書き直す（編集・複製・削除用）
+///
+/// 既存ファイルは `.bak` 拡張子でバックアップしてから上書きする。
+/// 既存ファイルにユーザーが書いていたコメントは失われるため、
+/// 安全のため `connections.yml.bak` を残す。
+pub fn save_all_connections(conns: &[ConnectionConfig]) -> Result<()> {
+    let path = expand_tilde("~/.config/lazydb/connections.yml");
+
+    // ディレクトリ作成
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("ディレクトリを作成できません: {:?}", parent))?;
+    }
+
+    // 既存ファイルを .bak にバックアップ
+    if path.exists() {
+        let bak = path.with_extension("yml.bak");
+        let _ = std::fs::copy(&path, &bak);
+    }
+
+    // 全エントリを手書き YAML で連結
+    let mut out = String::new();
+    for conn in conns {
+        out.push_str(&connection_to_yaml(conn));
+    }
+
+    std::fs::write(&path, out)
+        .with_context(|| format!("接続設定ファイルに書き込めません: {}", path.display()))?;
+
+    ensure_secure_permissions(&path);
+
+    Ok(())
 }
 
 /// 接続設定を connections.yml に追記する（既存内容・コメントを保持）

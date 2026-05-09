@@ -155,12 +155,34 @@ impl DbTypeChoice {
     }
 }
 
+/// フォームの利用モード（タイトル表示・保存挙動の分岐用）
+#[derive(Debug, Clone, PartialEq)]
+pub enum FormMode {
+    /// 新規追加
+    New,
+    /// 既存接続のコピーを基に新規追加
+    Duplicate,
+    /// 既存接続を上書き編集（usize はピッカー上の対象 index）
+    Edit(usize),
+}
+
+impl FormMode {
+    pub fn title(&self) -> &'static str {
+        match self {
+            FormMode::New => "New Connection",
+            FormMode::Duplicate => "Duplicate Connection",
+            FormMode::Edit(_) => "Edit Connection",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NewConnectionForm {
     pub conn_type: ConnFormType,
     pub db_type: DbTypeChoice,
     pub fields: Vec<(&'static str, String)>,
     pub cursor: usize,
+    pub form_mode: FormMode,
     // cursor == 0 は conn_type 選択行、cursor == 1 は db_type 選択行
     // 実際のフィールドは cursor >= 2
 }
@@ -172,9 +194,96 @@ impl NewConnectionForm {
             db_type: DbTypeChoice::Pg,
             fields: Vec::new(),
             cursor: 0,
+            form_mode: FormMode::New,
         };
         form.rebuild_fields();
         form
+    }
+
+    /// 既存の ConnectionConfig からフォームを構築する。
+    ///
+    /// `mode` には FormMode::Edit(index) または FormMode::Duplicate を渡す。
+    /// password フィールドは常に空で初期化する（既存値の表示・編集はしない）：
+    /// - Edit 時に空のまま保存すると既存設定（`keychain:NAME` 等）を維持する
+    /// - 入力すれば新しい値で keychain に上書き保存する
+    pub fn from_connection(conn: &ConnectionConfig, mode: FormMode) -> Self {
+        use crate::config::connections::ConnectionConfig as CC;
+
+        let conn_type = match conn {
+            CC::Direct(_) => ConnFormType::Direct,
+            CC::Ssh(_) => ConnFormType::Ssh,
+            CC::Ssm(_) => ConnFormType::Ssm,
+        };
+        let db_type = match conn.db_type() {
+            DbType::Postgresql => DbTypeChoice::Pg,
+            DbType::Mysql => DbTypeChoice::My,
+        };
+
+        let mut form = Self {
+            conn_type,
+            db_type,
+            fields: Vec::new(),
+            cursor: 0,
+            form_mode: mode.clone(),
+        };
+        form.rebuild_fields();
+
+        // 共通フィールドを上書き
+        let name_value = match &mode {
+            FormMode::Duplicate => format!("{}-copy", conn.name()),
+            _ => conn.name().to_string(),
+        };
+        form.set_field("name", &name_value);
+        if let Some(label) = conn.label() {
+            form.set_field("label", label);
+        }
+        form.set_field("readonly", if conn.is_readonly() { "true" } else { "false" });
+
+        match conn {
+            CC::Direct(c) => {
+                form.set_field("host", &c.host);
+                form.set_field("port", &c.port.to_string());
+                form.set_field("database", &c.database);
+                form.set_field("user", &c.user);
+            }
+            CC::Ssh(c) => {
+                form.set_field("ssh_host", &c.ssh_host);
+                if let Some(ref u) = c.ssh_user {
+                    form.set_field("ssh_user", u);
+                }
+                form.set_field("remote_db_host", &c.remote_db_host);
+                form.set_field("remote_db_port", &c.remote_db_port.to_string());
+                form.set_field("local_port", &c.local_port.to_string());
+                form.set_field("database", &c.database);
+                form.set_field("user", &c.user);
+            }
+            CC::Ssm(c) => {
+                form.set_field("instance_id", &c.instance_id);
+                form.set_field("ssh_user", &c.ssh_user);
+                if let Some(ref k) = c.ssh_key {
+                    form.set_field("ssh_key", k);
+                }
+                if let Some(ref p) = c.aws_profile {
+                    form.set_field("aws_profile", p);
+                }
+                form.set_field("remote_db_host", &c.remote_db_host);
+                form.set_field("remote_db_port", &c.remote_db_port.to_string());
+                form.set_field("local_port", &c.local_port.to_string());
+                form.set_field("database", &c.database);
+                form.set_field("user", &c.user);
+            }
+        }
+
+        // password はセキュリティ上、復元しない（空のまま）
+        // type / db_type 行をスキップして name フィールドにフォーカス
+        form.cursor = 2;
+        form
+    }
+
+    fn set_field(&mut self, key: &str, value: &str) {
+        if let Some((_, v)) = self.fields.iter_mut().find(|(k, _)| *k == key) {
+            *v = value.to_string();
+        }
     }
 
     /// conn_type と db_type に基づいてフィールドを再構築する
@@ -725,6 +834,24 @@ impl App {
                             spawn_tunnel(conn, self.tx.clone());
                         }
                     }
+                }
+            }
+            KeyCode::Char('d') if self.picker_cursor < self.connections.len() => {
+                // 選択中の接続を複製してフォームを開く
+                if let Some(conn) = self.connections.get(self.picker_cursor) {
+                    self.new_conn_form =
+                        NewConnectionForm::from_connection(conn, FormMode::Duplicate);
+                    self.mode = AppMode::NewConnectionWizard;
+                }
+            }
+            KeyCode::Char('e') if self.picker_cursor < self.connections.len() => {
+                // 選択中の接続を編集
+                if let Some(conn) = self.connections.get(self.picker_cursor) {
+                    self.new_conn_form = NewConnectionForm::from_connection(
+                        conn,
+                        FormMode::Edit(self.picker_cursor),
+                    );
+                    self.mode = AppMode::NewConnectionWizard;
                 }
             }
             KeyCode::Esc if self.active_connection.is_some() => {
@@ -1492,37 +1619,63 @@ impl App {
                 // 接続設定を構築
                 match self.build_connection_from_form() {
                     Ok(conn) => {
-                        use crate::config::connections::save_connection;
+                        use crate::config::connections::{save_all_connections, save_connection};
 
-                        // connections.yml に保存
-                        if let Err(e) = save_connection(&conn) {
-                            self.status_message = Some(format!("保存エラー: {}", e));
-                            return std::ops::ControlFlow::Continue(());
-                        }
-
-                        // connections に追加して即接続
-                        self.connections.push(conn.clone());
-                        self.picker_cursor = self.connections.len() - 1;
-                        self.resolved_password = conn.resolve_password().ok().flatten();
-                        self.active_connection = Some(ActiveConnectionInfo {
-                            name: conn.name().to_string(),
-                            label: conn.label().map(String::from),
-                            readonly: conn.is_readonly(),
-                        });
-                        self.mode = AppMode::Normal;
-                        // 接続切り替え時: 全タブの results をクリア（editor は保持）
-                        self.tabs.iter_mut().for_each(|t| t.results.clear());
-                        self.schema = SchemaState::new();
-                        self.schema.loading = true;
-
-                        match &conn {
-                            ConnectionConfig::Direct(_) => {
-                                self.status_message = Some(format!("接続中: {}...", conn.name()));
-                                spawn_fetch_tables(&conn, self.resolved_password.clone(), self.tx.clone());
+                        let form_mode = self.new_conn_form.form_mode.clone();
+                        match form_mode {
+                            FormMode::Edit(idx) => {
+                                if idx >= self.connections.len() {
+                                    self.status_message =
+                                        Some("編集対象が見つかりませんでした".to_string());
+                                    return std::ops::ControlFlow::Continue(());
+                                }
+                                self.connections[idx] = conn.clone();
+                                if let Err(e) = save_all_connections(&self.connections) {
+                                    self.status_message = Some(format!("保存エラー: {}", e));
+                                    return std::ops::ControlFlow::Continue(());
+                                }
+                                self.picker_cursor = idx;
+                                self.mode = AppMode::ConnectionPicker;
+                                self.status_message = Some(format!(
+                                    "接続を更新しました: {} (.bak にバックアップ済み)",
+                                    conn.name()
+                                ));
                             }
-                            ConnectionConfig::Ssh(_) | ConnectionConfig::Ssm(_) => {
-                                self.status_message = Some(format!("トンネル確立中: {}...", conn.name()));
-                                spawn_tunnel(conn, self.tx.clone());
+                            FormMode::New | FormMode::Duplicate => {
+                                if let Err(e) = save_connection(&conn) {
+                                    self.status_message = Some(format!("保存エラー: {}", e));
+                                    return std::ops::ControlFlow::Continue(());
+                                }
+                                self.connections.push(conn.clone());
+                                self.picker_cursor = self.connections.len() - 1;
+                                self.resolved_password = conn.resolve_password().ok().flatten();
+                                self.active_connection = Some(ActiveConnectionInfo {
+                                    name: conn.name().to_string(),
+                                    label: conn.label().map(String::from),
+                                    readonly: conn.is_readonly(),
+                                });
+                                self.mode = AppMode::Normal;
+                                // 接続切り替え時: 全タブの results をクリア（editor は保持）
+                                self.tabs.iter_mut().for_each(|t| t.results.clear());
+                                self.schema = SchemaState::new();
+                                self.schema.loading = true;
+
+                                match &conn {
+                                    ConnectionConfig::Direct(_) => {
+                                        self.status_message =
+                                            Some(format!("接続中: {}...", conn.name()));
+                                        spawn_fetch_tables(
+                                            &conn,
+                                            self.resolved_password.clone(),
+                                            self.tx.clone(),
+                                        );
+                                    }
+                                    ConnectionConfig::Ssh(_) | ConnectionConfig::Ssm(_) => {
+                                        self.status_message =
+                                            Some(format!("トンネル確立中: {}...", conn.name()));
+                                        spawn_tunnel(conn, self.tx.clone());
+                                    }
+                                }
                             }
                         }
                     }
@@ -1556,15 +1709,22 @@ impl App {
         let user = form.get("user").to_string();
         let password_raw = form.get("password").to_string();
 
-        // パスワードが入力されていたら Keychain に保存
-        let password_field = if password_raw.is_empty() {
-            None
-        } else {
+        // パスワードの決定ロジック
+        // - 入力あり: keychain に保存して `keychain:NAME` を設定
+        // - 入力空かつ編集モード: 既存接続の password フィールドを維持
+        // - 入力空かつ新規/複製: None
+        let password_field = if !password_raw.is_empty() {
             use crate::config::connections::set_keychain_password;
             if let Err(e) = set_keychain_password(&name, &password_raw) {
                 return Err(format!("キーチェーン保存エラー: {}", e));
             }
             Some(format!("keychain:{}", name))
+        } else if let FormMode::Edit(idx) = &form.form_mode {
+            self.connections
+                .get(*idx)
+                .and_then(|c| c.password_field().map(String::from))
+        } else {
+            None
         };
 
         use crate::config::connections::{DirectConfig, SshConfig, SsmConfig};
