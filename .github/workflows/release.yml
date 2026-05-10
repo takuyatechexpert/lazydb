@@ -77,3 +77,15 @@ jobs:
           files: |
             *.tar.gz
             *.sha256
+
+  homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update Homebrew formula
+        uses: dawidd6/action-homebrew-bump-formula@v4
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          tap: takuyatechexpert/homebrew-tap
+          formula: lazydb
+          tag: ${{ github.ref_name }}
