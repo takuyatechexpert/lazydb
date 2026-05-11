@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod mysql;
 pub mod postgres;
+pub mod sqlite;
 
 #[cfg(test)]
 mod tests;
@@ -8,10 +9,11 @@ mod tests;
 use adapter::{ColumnInfo, DbAdapter, QueryResult, TableInfo};
 use anyhow::Result;
 
-/// PostgreSQL / MySQL を統一的に扱うアダプター enum
+/// PostgreSQL / MySQL / SQLite を統一的に扱うアダプター enum
 pub enum AnyAdapter {
     Postgres(postgres::PostgresAdapter),
     Mysql(mysql::MysqlAdapter),
+    Sqlite(sqlite::SqliteAdapter),
 }
 
 impl AnyAdapter {
@@ -19,6 +21,7 @@ impl AnyAdapter {
         match self {
             AnyAdapter::Postgres(a) => adapter::DbAdapter::connect(a).await,
             AnyAdapter::Mysql(a) => adapter::DbAdapter::connect(a).await,
+            AnyAdapter::Sqlite(a) => adapter::DbAdapter::connect(a).await,
         }
     }
 
@@ -26,6 +29,7 @@ impl AnyAdapter {
         match self {
             AnyAdapter::Postgres(a) => a.execute(query).await,
             AnyAdapter::Mysql(a) => a.execute(query).await,
+            AnyAdapter::Sqlite(a) => a.execute(query).await,
         }
     }
 
@@ -33,6 +37,7 @@ impl AnyAdapter {
         match self {
             AnyAdapter::Postgres(a) => a.fetch_tables().await,
             AnyAdapter::Mysql(a) => a.fetch_tables().await,
+            AnyAdapter::Sqlite(a) => a.fetch_tables().await,
         }
     }
 
@@ -40,6 +45,7 @@ impl AnyAdapter {
         match self {
             AnyAdapter::Postgres(a) => a.fetch_columns(table).await,
             AnyAdapter::Mysql(a) => a.fetch_columns(table).await,
+            AnyAdapter::Sqlite(a) => a.fetch_columns(table).await,
         }
     }
 }

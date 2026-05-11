@@ -14,6 +14,7 @@ use db::{
     adapter::QueryResult,
     mysql::MysqlAdapter,
     postgres::PostgresAdapter,
+    sqlite::SqliteAdapter,
     AnyAdapter, LimitApplier, ReadonlyChecker,
 };
 use unicode_width::UnicodeWidthStr;
@@ -145,6 +146,7 @@ async fn cmd_list_connections(connections_path: Option<&str>) -> Result<()> {
             config::connections::ConnectionConfig::Direct(_) => "direct",
             config::connections::ConnectionConfig::Ssh(_) => "ssh",
             config::connections::ConnectionConfig::Ssm(_) => "ssm",
+            config::connections::ConnectionConfig::Sqlite(_) => "sqlite",
         };
         println!("{:<20} {:<8} {:<10} {:<12}", conn.name(), label, type_str, conn.db_type());
     }
@@ -200,43 +202,73 @@ async fn cmd_exec(
     let mut _tunnel: Option<Box<dyn std::any::Any>> = None;
     let password = conn_config.resolve_password()?;
 
-    let (host, port, database, user, db_type) = match conn_config {
-        config::connections::ConnectionConfig::Direct(c) => {
-            (c.host.clone(), c.port, c.database.clone(), c.user.clone(), &c.db_type)
+    // SQLite はトンネル不要・user/password 不要なので別経路で組み立てる
+    let mut adapter = match conn_config {
+        config::connections::ConnectionConfig::Sqlite(c) => {
+            AnyAdapter::Sqlite(SqliteAdapter::new(c.path.clone(), c.readonly))
         }
-        config::connections::ConnectionConfig::Ssh(c) => {
-            use tunnel::ssh::SshTunnel;
-            let tunnel = SshTunnel::start(
-                &c.ssh_host,
-                c.ssh_user.as_deref(),
-                &c.remote_db_host,
-                c.remote_db_port,
-                c.local_port,
-            )
-            .await?;
-            _tunnel = Some(Box::new(tunnel));
-            ("127.0.0.1".to_string(), c.local_port, c.database.clone(), c.user.clone(), &c.db_type)
-        }
-        config::connections::ConnectionConfig::Ssm(c) => {
-            use tunnel::ssm::SsmTunnel;
-            let tunnel = SsmTunnel::start(
-                &c.instance_id,
-                &c.ssh_user,
-                c.ssh_key.as_deref(),
-                c.aws_profile.as_deref(),
-                &c.remote_db_host,
-                c.remote_db_port,
-                c.local_port,
-            )
-            .await?;
-            _tunnel = Some(Box::new(tunnel));
-            ("127.0.0.1".to_string(), c.local_port, c.database.clone(), c.user.clone(), &c.db_type)
-        }
-    };
+        other => {
+            let (host, port, database, user, db_type) = match other {
+                config::connections::ConnectionConfig::Direct(c) => (
+                    c.host.clone(),
+                    c.port,
+                    c.database.clone(),
+                    c.user.clone(),
+                    &c.db_type,
+                ),
+                config::connections::ConnectionConfig::Ssh(c) => {
+                    use tunnel::ssh::SshTunnel;
+                    let tunnel = SshTunnel::start(
+                        &c.ssh_host,
+                        c.ssh_user.as_deref(),
+                        &c.remote_db_host,
+                        c.remote_db_port,
+                        c.local_port,
+                    )
+                    .await?;
+                    _tunnel = Some(Box::new(tunnel));
+                    (
+                        "127.0.0.1".to_string(),
+                        c.local_port,
+                        c.database.clone(),
+                        c.user.clone(),
+                        &c.db_type,
+                    )
+                }
+                config::connections::ConnectionConfig::Ssm(c) => {
+                    use tunnel::ssm::SsmTunnel;
+                    let tunnel = SsmTunnel::start(
+                        &c.instance_id,
+                        &c.ssh_user,
+                        c.ssh_key.as_deref(),
+                        c.aws_profile.as_deref(),
+                        &c.remote_db_host,
+                        c.remote_db_port,
+                        c.local_port,
+                    )
+                    .await?;
+                    _tunnel = Some(Box::new(tunnel));
+                    (
+                        "127.0.0.1".to_string(),
+                        c.local_port,
+                        c.database.clone(),
+                        c.user.clone(),
+                        &c.db_type,
+                    )
+                }
+                config::connections::ConnectionConfig::Sqlite(_) => unreachable!(),
+            };
 
-    let mut adapter = match db_type {
-        DbType::Postgresql => AnyAdapter::Postgres(PostgresAdapter::new(host, port, database, user, password)),
-        DbType::Mysql => AnyAdapter::Mysql(MysqlAdapter::new(host, port, database, user, password)),
+            match db_type {
+                DbType::Postgresql => AnyAdapter::Postgres(PostgresAdapter::new(
+                    host, port, database, user, password,
+                )),
+                DbType::Mysql => {
+                    AnyAdapter::Mysql(MysqlAdapter::new(host, port, database, user, password))
+                }
+                DbType::Sqlite => unreachable!("SQLite is handled in the outer match"),
+            }
+        }
     };
 
     // 接続確認

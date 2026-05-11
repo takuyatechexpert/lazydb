@@ -35,6 +35,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
                 ConnectionConfig::Direct(_) => "direct",
                 ConnectionConfig::Ssh(_) => "ssh",
                 ConnectionConfig::Ssm(_) => "ssm",
+                ConnectionConfig::Sqlite(_) => "sqlite",
             };
 
             let db_str = conn.db_type().to_string();

@@ -12,6 +12,7 @@ use crate::config::connections::{ConnectionConfig, DbType};
 use crate::db::adapter::{ColumnInfo, QueryResult, TableInfo};
 use crate::db::mysql::MysqlAdapter;
 use crate::db::postgres::PostgresAdapter;
+use crate::db::sqlite::SqliteAdapter;
 use crate::db::{AnyAdapter, LimitApplier, ReadonlyChecker};
 use crate::export::{self, ExportFormat};
 use crate::history::{HistoryEntry, HistoryStore};
@@ -117,6 +118,9 @@ impl ConnFormType {
 pub enum DbTypeChoice {
     Pg,
     My,
+    /// SQLite はトンネル不要のローカルファイル接続。
+    /// 選択時は conn_type が自動的に Direct に固定される。
+    Sl,
 }
 
 impl DbTypeChoice {
@@ -124,13 +128,24 @@ impl DbTypeChoice {
         match self {
             DbTypeChoice::Pg => "pg",
             DbTypeChoice::My => "my",
+            DbTypeChoice::Sl => "sqlite",
         }
     }
 
-    fn toggle(&self) -> Self {
+    /// 次の選択肢へ循環（pg → my → sqlite → pg）
+    fn cycle_next(&self) -> Self {
         match self {
             DbTypeChoice::Pg => DbTypeChoice::My,
+            DbTypeChoice::My => DbTypeChoice::Sl,
+            DbTypeChoice::Sl => DbTypeChoice::Pg,
+        }
+    }
+
+    fn cycle_prev(&self) -> Self {
+        match self {
+            DbTypeChoice::Pg => DbTypeChoice::Sl,
             DbTypeChoice::My => DbTypeChoice::Pg,
+            DbTypeChoice::Sl => DbTypeChoice::My,
         }
     }
 
@@ -138,6 +153,7 @@ impl DbTypeChoice {
         match self {
             DbTypeChoice::Pg => DbType::Postgresql,
             DbTypeChoice::My => DbType::Mysql,
+            DbTypeChoice::Sl => DbType::Sqlite,
         }
     }
 
@@ -145,6 +161,7 @@ impl DbTypeChoice {
         match self {
             DbTypeChoice::Pg => "5432",
             DbTypeChoice::My => "3306",
+            DbTypeChoice::Sl => "",
         }
     }
 
@@ -152,7 +169,13 @@ impl DbTypeChoice {
         match self {
             DbTypeChoice::Pg => "postgres",
             DbTypeChoice::My => "root",
+            DbTypeChoice::Sl => "",
         }
+    }
+
+    /// SQLite かどうか
+    fn is_sqlite(&self) -> bool {
+        matches!(self, DbTypeChoice::Sl)
     }
 }
 
@@ -214,10 +237,14 @@ impl NewConnectionForm {
             CC::Direct(_) => ConnFormType::Direct,
             CC::Ssh(_) => ConnFormType::Ssh,
             CC::Ssm(_) => ConnFormType::Ssm,
+            // SQLite は SSH/SSM と無縁。conn_type は Direct 扱いとしておき、
+            // UI 上は db_type=sqlite により path 専用フォームが描画される。
+            CC::Sqlite(_) => ConnFormType::Direct,
         };
         let db_type = match conn.db_type() {
             DbType::Postgresql => DbTypeChoice::Pg,
             DbType::Mysql => DbTypeChoice::My,
+            DbType::Sqlite => DbTypeChoice::Sl,
         };
 
         let mut form = Self {
@@ -241,6 +268,9 @@ impl NewConnectionForm {
         form.set_field("readonly", if conn.is_readonly() { "true" } else { "false" });
 
         match conn {
+            CC::Sqlite(c) => {
+                form.set_field("path", &c.path);
+            }
             CC::Direct(c) => {
                 form.set_field("host", &c.host);
                 form.set_field("port", &c.port.to_string());
@@ -289,6 +319,20 @@ impl NewConnectionForm {
 
     /// conn_type と db_type に基づいてフィールドを再構築する
     fn rebuild_fields(&mut self) {
+        // SQLite の場合は conn_type を Direct に固定して、path のみのフォームを構築する。
+        // ホスト/ポート/ユーザ/パスワードといった概念がそもそも存在しないため。
+        if self.db_type.is_sqlite() {
+            self.conn_type = ConnFormType::Direct;
+            self.fields = vec![
+                ("name", String::new()),
+                ("label", String::new()),
+                ("path", String::new()),
+                ("readonly", "false".to_string()),
+            ];
+            self.cursor = 0;
+            return;
+        }
+
         let port = self.db_type.default_port().to_string();
         let user = self.db_type.default_user().to_string();
 
@@ -908,7 +952,7 @@ impl App {
                     self.schema = SchemaState::new();
                     self.schema.loading = true;
                     match &conn {
-                        ConnectionConfig::Direct(_) => {
+                        ConnectionConfig::Direct(_) | ConnectionConfig::Sqlite(_) => {
                             self.status_message = Some(format!("接続中: {}...", conn.name()));
                             spawn_fetch_tables(&conn, self.resolved_password.clone(), self.tx.clone());
                         }
@@ -1657,8 +1701,13 @@ impl App {
                         self.new_conn_form.conn_type = self.new_conn_form.conn_type.cycle_next();
                         self.new_conn_form.rebuild_fields();
                     }
-                    'h' | 'l' if on_db_type_row => {
-                        self.new_conn_form.db_type = self.new_conn_form.db_type.toggle();
+                    'h' if on_db_type_row => {
+                        self.new_conn_form.db_type = self.new_conn_form.db_type.cycle_prev();
+                        self.new_conn_form.rebuild_fields();
+                        self.new_conn_form.cursor = 1;
+                    }
+                    'l' if on_db_type_row => {
+                        self.new_conn_form.db_type = self.new_conn_form.db_type.cycle_next();
                         self.new_conn_form.rebuild_fields();
                         self.new_conn_form.cursor = 1;
                     }
@@ -1688,7 +1737,7 @@ impl App {
                         self.new_conn_form.rebuild_fields();
                     }
                     1 => {
-                        self.new_conn_form.db_type = self.new_conn_form.db_type.toggle();
+                        self.new_conn_form.db_type = self.new_conn_form.db_type.cycle_prev();
                         self.new_conn_form.rebuild_fields();
                         self.new_conn_form.cursor = 1; // db_type 行に留まる
                     }
@@ -1706,7 +1755,7 @@ impl App {
                         self.new_conn_form.rebuild_fields();
                     }
                     1 => {
-                        self.new_conn_form.db_type = self.new_conn_form.db_type.toggle();
+                        self.new_conn_form.db_type = self.new_conn_form.db_type.cycle_next();
                         self.new_conn_form.rebuild_fields();
                         self.new_conn_form.cursor = 1;
                     }
@@ -1769,7 +1818,7 @@ impl App {
                                 self.schema.loading = true;
 
                                 match &conn {
-                                    ConnectionConfig::Direct(_) => {
+                                    ConnectionConfig::Direct(_) | ConnectionConfig::Sqlite(_) => {
                                         self.status_message =
                                             Some(format!("接続中: {}...", conn.name()));
                                         spawn_fetch_tables(
@@ -1803,10 +1852,9 @@ impl App {
         let db_type = form.db_type.to_db_type();
 
         let name = form.get("name").to_string();
-        let database = form.get("database").to_string();
 
-        if name.is_empty() || database.is_empty() {
-            return Err("name と database は必須です".to_string());
+        if name.is_empty() {
+            return Err("name は必須です".to_string());
         }
 
         let label = {
@@ -1814,6 +1862,27 @@ impl App {
             if v.is_empty() { None } else { Some(v) }
         };
         let readonly = matches!(form.get("readonly").to_lowercase().as_str(), "true" | "yes" | "1");
+
+        // SQLite は path のみの専用バリアントを構築して早期 return
+        if form.db_type.is_sqlite() {
+            use crate::config::connections::SqliteConfig;
+            let path = form.get("path").to_string();
+            if path.is_empty() {
+                return Err("path は必須です".to_string());
+            }
+            return Ok(ConnectionConfig::Sqlite(SqliteConfig {
+                name,
+                label,
+                readonly,
+                path,
+            }));
+        }
+
+        let database = form.get("database").to_string();
+        if database.is_empty() {
+            return Err("database は必須です".to_string());
+        }
+
         let user = form.get("user").to_string();
         let password_raw = form.get("password").to_string();
 
@@ -2108,15 +2177,25 @@ fn quote_identifier(name: &str, db_type: &DbType) -> String {
 }
 
 fn build_adapter(conn: &ConnectionConfig, password: Option<String>) -> Option<AnyAdapter> {
+    // SQLite は host/port/user/password を持たない別経路で構築
+    if let ConnectionConfig::Sqlite(c) = conn {
+        return Some(AnyAdapter::Sqlite(SqliteAdapter::new(
+            c.path.clone(),
+            c.readonly,
+        )));
+    }
+
     let (host, port, database, user, db_type) = match conn {
         ConnectionConfig::Direct(c) => (c.host.clone(), c.port, c.database.clone(), c.user.clone(), &c.db_type),
         ConnectionConfig::Ssh(c) => ("127.0.0.1".to_string(), c.local_port, c.database.clone(), c.user.clone(), &c.db_type),
         ConnectionConfig::Ssm(c) => ("127.0.0.1".to_string(), c.local_port, c.database.clone(), c.user.clone(), &c.db_type),
+        ConnectionConfig::Sqlite(_) => unreachable!("SQLite is handled above"),
     };
 
     match db_type {
         DbType::Postgresql => Some(AnyAdapter::Postgres(PostgresAdapter::new(host, port, database, user, password))),
         DbType::Mysql => Some(AnyAdapter::Mysql(MysqlAdapter::new(host, port, database, user, password))),
+        DbType::Sqlite => unreachable!("SQLite is handled above"),
     }
 }
 
@@ -2390,7 +2469,7 @@ pub async fn run(connections: Vec<ConnectionConfig>, config: AppConfig, initial_
             app.schema = SchemaState::new();
             app.schema.loading = true;
             match &conn {
-                ConnectionConfig::Direct(_) => {
+                ConnectionConfig::Direct(_) | ConnectionConfig::Sqlite(_) => {
                     app.status_message = Some(format!("接続中: {}...", conn.name()));
                     spawn_fetch_tables(&conn, app.resolved_password.clone(), app.tx.clone());
                 }

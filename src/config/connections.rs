@@ -9,6 +9,7 @@ pub enum DbType {
     #[default]
     Postgresql,
     Mysql,
+    Sqlite,
 }
 
 impl fmt::Display for DbType {
@@ -16,6 +17,7 @@ impl fmt::Display for DbType {
         match self {
             DbType::Postgresql => write!(f, "postgresql"),
             DbType::Mysql => write!(f, "mysql"),
+            DbType::Sqlite => write!(f, "sqlite"),
         }
     }
 }
@@ -25,13 +27,15 @@ impl DbType {
         match self {
             DbType::Postgresql => 5432,
             DbType::Mysql => 3306,
+            // SQLite はファイル接続のためポート概念なし。0 を返す
+            DbType::Sqlite => 0,
         }
     }
 
-    /// 識別子をクォートする（PostgreSQL: "...", MySQL: `...`）
+    /// 識別子をクォートする（PostgreSQL / SQLite: "...", MySQL: `...`）
     pub fn quote_identifier(&self, name: &str) -> String {
         match self {
-            DbType::Postgresql => {
+            DbType::Postgresql | DbType::Sqlite => {
                 let needs_quote = name.is_empty()
                     || name.chars().next().is_none_or(|c| !c.is_ascii_lowercase() && c != '_')
                     || !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
@@ -60,6 +64,9 @@ pub enum ConnectionConfig {
     Direct(DirectConfig),
     Ssh(SshConfig),
     Ssm(SsmConfig),
+    /// SQLite は単一ファイル接続のためトンネル不要・user/password 不要。
+    /// 専用バリアントとして Direct/Ssh/Ssm から分離する。
+    Sqlite(SqliteConfig),
 }
 
 impl ConnectionConfig {
@@ -68,6 +75,7 @@ impl ConnectionConfig {
             ConnectionConfig::Direct(c) => &c.name,
             ConnectionConfig::Ssh(c) => &c.name,
             ConnectionConfig::Ssm(c) => &c.name,
+            ConnectionConfig::Sqlite(c) => &c.name,
         }
     }
 
@@ -76,6 +84,7 @@ impl ConnectionConfig {
             ConnectionConfig::Direct(c) => c.label.as_deref(),
             ConnectionConfig::Ssh(c) => c.label.as_deref(),
             ConnectionConfig::Ssm(c) => c.label.as_deref(),
+            ConnectionConfig::Sqlite(c) => c.label.as_deref(),
         }
     }
 
@@ -84,14 +93,18 @@ impl ConnectionConfig {
             ConnectionConfig::Direct(c) => c.readonly,
             ConnectionConfig::Ssh(c) => c.readonly,
             ConnectionConfig::Ssm(c) => c.readonly,
+            ConnectionConfig::Sqlite(c) => c.readonly,
         }
     }
 
     pub fn db_type(&self) -> &DbType {
+        // SQLite バリアントは常に DbType::Sqlite を返すための静的参照。
+        static SQLITE_TYPE: DbType = DbType::Sqlite;
         match self {
             ConnectionConfig::Direct(c) => &c.db_type,
             ConnectionConfig::Ssh(c) => &c.db_type,
             ConnectionConfig::Ssm(c) => &c.db_type,
+            ConnectionConfig::Sqlite(_) => &SQLITE_TYPE,
         }
     }
 
@@ -102,6 +115,7 @@ impl ConnectionConfig {
             ConnectionConfig::Direct(c) => c.password.as_deref(),
             ConnectionConfig::Ssh(c) => c.password.as_deref(),
             ConnectionConfig::Ssm(c) => c.password.as_deref(),
+            ConnectionConfig::Sqlite(_) => None,
         }
     }
 
@@ -111,6 +125,7 @@ impl ConnectionConfig {
             ConnectionConfig::Direct(c) => c.password.as_deref(),
             ConnectionConfig::Ssh(c) => c.password.as_deref(),
             ConnectionConfig::Ssm(c) => c.password.as_deref(),
+            ConnectionConfig::Sqlite(_) => return Ok(None),
         };
         resolve_password_value(raw)
     }
@@ -367,6 +382,21 @@ fn connection_to_yaml(conn: &ConnectionConfig) -> String {
             lines.push(String::new());
             lines.join("\n")
         }
+        ConnectionConfig::Sqlite(c) => {
+            let mut lines = vec![
+                format!("\n- type: sqlite"),
+                format!("  name: {}", c.name),
+            ];
+            if let Some(ref label) = c.label {
+                lines.push(format!("  label: {}", label));
+            }
+            if c.readonly {
+                lines.push("  readonly: true".to_string());
+            }
+            lines.push(format!("  path: {}", c.path));
+            lines.push(String::new());
+            lines.join("\n")
+        }
     }
 }
 
@@ -456,6 +486,17 @@ pub struct SsmConfig {
 
 fn default_port() -> u16 {
     5432
+}
+
+/// SQLite 接続設定。
+/// `path` はチルダ展開対応のローカルファイルパス（`:memory:` も可）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqliteConfig {
+    pub name: String,
+    pub label: Option<String>,
+    #[serde(default)]
+    pub readonly: bool,
+    pub path: String,
 }
 
 #[cfg(test)]
@@ -565,5 +606,92 @@ mod tests {
 "#;
         let conns: Vec<ConnectionConfig> = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(conns[0].db_type(), &DbType::Mysql);
+    }
+
+    // ── SQLite サポート ──
+
+    #[test]
+    fn db_type_sqlite_display() {
+        assert_eq!(format!("{}", DbType::Sqlite), "sqlite");
+    }
+
+    #[test]
+    fn db_type_sqlite_default_port_is_zero() {
+        // SQLite はファイル接続のためポート概念なし
+        assert_eq!(DbType::Sqlite.default_port(), 0);
+    }
+
+    #[test]
+    fn sqlite_quote_uppercase_uses_double_quotes() {
+        // SQLite は PostgreSQL と同じ "..." クォート
+        assert_eq!(DbType::Sqlite.quote_identifier("Users"), "\"Users\"");
+    }
+
+    #[test]
+    fn sqlite_quote_lowercase_no_quote() {
+        assert_eq!(DbType::Sqlite.quote_identifier("users"), "users");
+    }
+
+    #[test]
+    fn deserialize_sqlite_connection() {
+        let yaml = r#"
+- type: sqlite
+  name: local-sqlite
+  path: /tmp/test.db
+"#;
+        let conns: Vec<ConnectionConfig> = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(conns[0].name(), "local-sqlite");
+        assert_eq!(conns[0].db_type(), &DbType::Sqlite);
+        assert!(!conns[0].is_readonly());
+        match &conns[0] {
+            ConnectionConfig::Sqlite(c) => assert_eq!(c.path, "/tmp/test.db"),
+            _ => panic!("expected Sqlite variant"),
+        }
+    }
+
+    #[test]
+    fn deserialize_sqlite_readonly() {
+        let yaml = r#"
+- type: sqlite
+  name: ro
+  readonly: true
+  path: /tmp/ro.db
+"#;
+        let conns: Vec<ConnectionConfig> = serde_yaml::from_str(yaml).unwrap();
+        assert!(conns[0].is_readonly());
+    }
+
+    #[test]
+    fn sqlite_resolve_password_is_none() {
+        let conn = ConnectionConfig::Sqlite(SqliteConfig {
+            name: "x".into(),
+            label: None,
+            readonly: false,
+            path: "/tmp/x.db".into(),
+        });
+        assert!(conn.resolve_password().unwrap().is_none());
+        assert!(conn.password_field().is_none());
+    }
+
+    #[test]
+    fn sqlite_yaml_round_trip_via_save_helper() {
+        // connection_to_yaml が SQLite で必須フィールドを書き出すことを検証
+        let conn = ConnectionConfig::Sqlite(SqliteConfig {
+            name: "demo".into(),
+            label: Some("local".into()),
+            readonly: true,
+            path: "~/data/demo.db".into(),
+        });
+        let yaml = super::connection_to_yaml(&conn);
+        assert!(yaml.contains("- type: sqlite"));
+        assert!(yaml.contains("name: demo"));
+        assert!(yaml.contains("label: local"));
+        assert!(yaml.contains("readonly: true"));
+        assert!(yaml.contains("path: ~/data/demo.db"));
+
+        // 再パースできること
+        let parsed: Vec<ConnectionConfig> = serde_yaml::from_str(yaml.trim_start()).unwrap();
+        assert_eq!(parsed[0].name(), "demo");
+        assert_eq!(parsed[0].db_type(), &DbType::Sqlite);
     }
 }

@@ -20,6 +20,13 @@
   user: root
   password: "env:MYSQL_PWD"
 
+# SQLite 接続（ローカルファイル）
+- name: local-sqlite
+  label: local
+  type: sqlite
+  # readonly: true                  # 読み取り専用で開く
+  path: ~/data/myapp.db             # チルダ展開対応 / `:memory:` も可
+
 # SSH トンネル
 - name: staging
   label: stg
