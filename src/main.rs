@@ -2,6 +2,7 @@ mod config;
 mod db;
 mod export;
 mod history;
+mod session;
 mod tunnel;
 mod tui;
 

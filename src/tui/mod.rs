@@ -15,6 +15,7 @@ use crate::db::postgres::PostgresAdapter;
 use crate::db::{AnyAdapter, LimitApplier, ReadonlyChecker};
 use crate::export::{self, ExportFormat};
 use crate::history::{HistoryEntry, HistoryStore};
+use crate::session::{ConnectionSession, SessionState, TabSnapshot};
 use crate::tunnel::Tunnel;
 use anyhow::Result;
 use crossterm::{
@@ -465,6 +466,9 @@ pub struct App {
     /// ヘルプポップアップの縦スクロールオフセット。
     /// `?` で開くたびに 0 にリセットされ、ポップアップ内の j/k/PgDn/g などで操作する。
     pub help_scroll: u16,
+    /// 接続単位で永続化したタブ群のインメモリキャッシュ。
+    /// 接続切替時に「直前の接続のタブ群を取り込み → 次の接続のタブ群を展開」する。
+    pub session_state: SessionState,
 }
 
 impl App {
@@ -510,7 +514,24 @@ impl App {
             resolved_password: None,
             pending_z: false,
             help_scroll: 0,
+            session_state: SessionState::default(),
         }
+    }
+
+    /// 接続切替直前に呼び出すヘルパ。
+    /// 現在のタブ群を `session_state` に取り込んだうえで、新接続のタブ群を展開する。
+    /// 新接続に保存済みタブが無い場合は初期状態（Tab 1 つ）に戻す。
+    pub fn switch_connection_session(&mut self, prev: Option<&str>, next: &str) {
+        if let Some(prev_name) = prev {
+            let snap = self.capture_connection_session();
+            self.session_state.set(prev_name.to_string(), snap);
+        }
+        let next_session = self
+            .session_state
+            .get(next)
+            .cloned()
+            .unwrap_or_default();
+        self.apply_connection_session(next_session);
     }
 
     // ── タブ操作 ──
@@ -552,6 +573,55 @@ impl App {
         } else {
             self.active_tab -= 1;
         }
+    }
+
+    // ── セッション永続化（接続単位） ──
+
+    /// 現在のタブ群を ConnectionSession に書き出す。
+    /// editor の本文と論理カーソル位置のみを保存する（結果セットや実行履歴は対象外）。
+    pub fn capture_connection_session(&self) -> ConnectionSession {
+        let tabs = self
+            .tabs
+            .iter()
+            .map(|t| TabSnapshot {
+                name: t.name.clone(),
+                content: t.editor.lines.join("\n"),
+                cursor_row: t.editor.cursor.0,
+                cursor_col: t.editor.cursor.1,
+            })
+            .collect();
+        ConnectionSession {
+            tabs,
+            active_tab: self.active_tab,
+        }
+    }
+
+    /// 接続単位の保存タブをエディタへ展開する。
+    /// `session.tabs` が空のときは初期状態（Tab 1 つ）にリセットする。
+    pub fn apply_connection_session(&mut self, session: ConnectionSession) {
+        if session.tabs.is_empty() {
+            self.tabs = vec![Tab::new(1)];
+            self.active_tab = 0;
+            self.next_tab_id = 2;
+            return;
+        }
+        let mut tabs = Vec::with_capacity(session.tabs.len().min(MAX_TABS));
+        for (i, snap) in session.tabs.into_iter().take(MAX_TABS).enumerate() {
+            let mut tab = Tab::new(i + 1);
+            tab.name = snap.name;
+            tab.editor.lines = if snap.content.is_empty() {
+                vec![String::new()]
+            } else {
+                snap.content.split('\n').map(String::from).collect()
+            };
+            let row = snap.cursor_row.min(tab.editor.lines.len().saturating_sub(1));
+            let col = snap.cursor_col.min(tab.editor.lines[row].chars().count());
+            tab.editor.cursor = (row, col);
+            tabs.push(tab);
+        }
+        self.next_tab_id = tabs.len() + 1;
+        self.active_tab = session.active_tab.min(tabs.len().saturating_sub(1));
+        self.tabs = tabs;
     }
 
     // ── 読み取り専用アクセサ ──
@@ -818,13 +888,22 @@ impl App {
                             tunnel.kill().await;
                         });
                     }
+                    // セッション切り替え: 直前の接続のタブを退避し、新接続のタブを展開する。
+                    // 同じ接続を再選択した場合は何もしない（タブをそのまま維持）。
+                    let prev_name = self
+                        .active_connection
+                        .as_ref()
+                        .map(|c| c.name.clone());
+                    if prev_name.as_deref() != Some(conn.name()) {
+                        self.switch_connection_session(prev_name.as_deref(), conn.name());
+                    }
                     self.active_connection = Some(ActiveConnectionInfo {
                         name: conn.name().to_string(),
                         label: conn.label().map(String::from),
                         readonly: conn.is_readonly(),
                     });
                     self.mode = AppMode::Normal;
-                    // 接続切り替え時: 全タブの results をクリア（editor は保持）
+                    // 結果セットはクエリ再実行が必要なのでクリア（editor は session で復元済み）
                     self.tabs.iter_mut().for_each(|t| t.results.clear());
                     self.schema = SchemaState::new();
                     self.schema.loading = true;
@@ -2279,6 +2358,11 @@ pub async fn run(connections: Vec<ConnectionConfig>, config: AppConfig, initial_
     let (tx, mut rx) = mpsc::channel::<AppEvent>(100);
     let mut app = App::new(connections, config.clone(), tx.clone());
 
+    // 接続別セッションをインメモリへロード。
+    // 実際のタブ展開は「接続が決まったタイミング」で行うため、ここでは状態だけ持っておく。
+    let session_store = crate::session::SessionStore::new();
+    app.session_state = session_store.load();
+
     // 初期接続の決定: --connection > config.default_connection > ピッカー表示
     let auto_conn_name = initial_connection
         .map(String::from)
@@ -2295,6 +2379,8 @@ pub async fn run(connections: Vec<ConnectionConfig>, config: AppConfig, initial_
             app.picker_cursor = idx;
             let conn = app.connections[idx].clone();
             app.resolved_password = conn.resolve_password().ok().flatten();
+            // 自動接続の場合も保存済みタブを展開する（初回接続なので prev は None）
+            app.switch_connection_session(None, conn.name());
             app.active_connection = Some(ActiveConnectionInfo {
                 name: conn.name().to_string(),
                 label: conn.label().map(String::from),
@@ -2394,6 +2480,16 @@ pub async fn run(connections: Vec<ConnectionConfig>, config: AppConfig, initial_
         } else {
             break;
         }
+    }
+
+    // 現在の接続のタブ群を取り込んでからファイルへ書き出す。
+    // active_connection が無い場合（一度も接続せず終了）はファイル更新だけ行う。
+    if let Some(name) = app.active_connection.as_ref().map(|c| c.name.clone()) {
+        let snap = app.capture_connection_session();
+        app.session_state.set(name, snap);
+    }
+    if let Err(err) = session_store.save(&app.session_state) {
+        eprintln!("session の保存に失敗しました: {}", err);
     }
 
     // トンネルのクリーンアップ
