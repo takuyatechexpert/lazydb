@@ -718,3 +718,86 @@ fn pending_z_resets_on_mode_change() {
     let _ = app.handle_key(key(KeyCode::Esc));
     assert!(!app.pending_z);
 }
+
+// ── New Connection Wizard でのペースト ──
+
+#[test]
+fn paste_into_new_conn_wizard_appends_to_text_field() {
+    let mut app = test_app();
+    app.mode = AppMode::NewConnectionWizard;
+    app.new_conn_form = NewConnectionForm::new();
+    // name フィールド（cursor=2 が name 行）にカーソルを合わせる
+    app.new_conn_form.cursor = 2;
+
+    let _ = app.handle_paste("my-db".to_string());
+
+    assert_eq!(app.new_conn_form.get("name"), "my-db");
+}
+
+#[test]
+fn paste_into_new_conn_wizard_strips_control_chars() {
+    let mut app = test_app();
+    app.mode = AppMode::NewConnectionWizard;
+    app.new_conn_form = NewConnectionForm::new();
+    app.new_conn_form.cursor = 2; // name
+
+    // 改行・タブ等を含む文字列を貼り付け
+    let _ = app.handle_paste("foo\nbar\tbaz\r\n".to_string());
+
+    // 制御文字は除去された結果が結合される
+    assert_eq!(app.new_conn_form.get("name"), "foobarbaz");
+}
+
+#[test]
+fn paste_on_type_row_is_ignored() {
+    let mut app = test_app();
+    app.mode = AppMode::NewConnectionWizard;
+    app.new_conn_form = NewConnectionForm::new();
+    // cursor=0 は type 選択行（特殊行）→ ペースト無効
+    app.new_conn_form.cursor = 0;
+
+    let _ = app.handle_paste("noise".to_string());
+
+    // どのフィールドにも書き込まれていないこと
+    assert!(app.new_conn_form.get("name").is_empty());
+}
+
+#[test]
+fn paste_on_db_type_row_is_ignored() {
+    let mut app = test_app();
+    app.mode = AppMode::NewConnectionWizard;
+    app.new_conn_form = NewConnectionForm::new();
+    // cursor=1 は db_type 選択行（特殊行）→ ペースト無効
+    app.new_conn_form.cursor = 1;
+
+    let _ = app.handle_paste("noise".to_string());
+
+    assert!(app.new_conn_form.get("name").is_empty());
+}
+
+#[test]
+fn paste_on_readonly_toggle_is_ignored() {
+    let mut app = test_app();
+    app.mode = AppMode::NewConnectionWizard;
+    app.new_conn_form = NewConnectionForm::new();
+    // Direct フォームでは末尾フィールドが readonly。is_current_bool_toggle が true な行は無効
+    let total = app.new_conn_form.fields.len();
+    app.new_conn_form.cursor = 2 + total - 1; // readonly 行
+    assert!(app.new_conn_form.is_current_bool_toggle());
+
+    let prev = app.new_conn_form.get("readonly").to_string();
+    let _ = app.handle_paste("true".to_string());
+
+    assert_eq!(app.new_conn_form.get("readonly"), prev);
+}
+
+#[test]
+fn paste_into_export_path_input_appends() {
+    let mut app = test_app();
+    app.mode = AppMode::ExportPathInput;
+    app.export_path_input.clear();
+
+    let _ = app.handle_paste("/tmp/out.csv\n".to_string());
+
+    assert_eq!(app.export_path_input, "/tmp/out.csv");
+}

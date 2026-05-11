@@ -853,22 +853,52 @@ impl App {
     }
 
     fn handle_paste(&mut self, text: String) -> std::ops::ControlFlow<()> {
-        // ペーストはエディタペインがアクティブな時のみ受け付ける
-        if !matches!(self.mode, AppMode::Normal) {
-            return std::ops::ControlFlow::Continue(());
+        match self.mode {
+            AppMode::Normal => {
+                // ペーストはエディタペインがアクティブな時のみ受け付ける
+                if self.active_panel != Panel::Editor {
+                    return std::ops::ControlFlow::Continue(());
+                }
+                let idx = self.active_tab;
+                // 補完ポップアップは閉じる（ペースト挿入と相性が悪いため）
+                self.tabs[idx].editor.completion.close();
+                // Insert モードへ遷移してから一括挿入する
+                if self.tabs[idx].editor.mode != editor::EditorMode::Insert {
+                    self.tabs[idx].editor.enter_insert();
+                }
+                self.tabs[idx].editor.insert_str(&text);
+                self.update_editor_completion();
+            }
+            AppMode::NewConnectionWizard => {
+                // type / db_type / 真偽値トグル行ではペースト無効。
+                // それ以外のテキストフィールド（name / host / path / password など）には
+                // 制御文字を除去した上で末尾に追記する。
+                if self.new_conn_form.cursor < 2 || self.new_conn_form.is_current_bool_toggle() {
+                    return std::ops::ControlFlow::Continue(());
+                }
+                let sanitized: String = text.chars().filter(|c| !c.is_control()).collect();
+                if sanitized.is_empty() {
+                    return std::ops::ControlFlow::Continue(());
+                }
+                if let Some(val) = self.new_conn_form.current_field_mut() {
+                    val.push_str(&sanitized);
+                }
+            }
+            AppMode::ExportPathInput => {
+                // エクスポート先パス入力にもペーストできるように対応
+                let sanitized: String = text.chars().filter(|c| !c.is_control()).collect();
+                self.export_path_input.push_str(&sanitized);
+            }
+            AppMode::HistoryPicker => {
+                // 履歴フィルタにペーストできるように対応（フィルタは1行のため改行除去）
+                let sanitized: String = text.chars().filter(|c| !c.is_control()).collect();
+                if !sanitized.is_empty() {
+                    self.history_filter.push_str(&sanitized);
+                    self.refresh_history_filter();
+                }
+            }
+            _ => {}
         }
-        if self.active_panel != Panel::Editor {
-            return std::ops::ControlFlow::Continue(());
-        }
-        let idx = self.active_tab;
-        // 補完ポップアップは閉じる（ペースト挿入と相性が悪いため）
-        self.tabs[idx].editor.completion.close();
-        // Insert モードへ遷移してから一括挿入する
-        if self.tabs[idx].editor.mode != editor::EditorMode::Insert {
-            self.tabs[idx].editor.enter_insert();
-        }
-        self.tabs[idx].editor.insert_str(&text);
-        self.update_editor_completion();
         std::ops::ControlFlow::Continue(())
     }
 
