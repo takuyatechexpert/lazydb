@@ -27,6 +27,20 @@
   # readonly: true                  # 読み取り専用で開く
   path: ~/data/myapp.db             # チルダ展開対応 / `:memory:` も可
 
+# Redis 接続
+# クエリエディタには Redis コマンドをそのまま入力する（例: `GET foo` / `KEYS user:*` / `HGETALL myhash`）
+# サイドバーには論理 DB 番号（db0 / db1 …）が表示される
+- name: local-redis
+  label: local
+  type: direct
+  db_type: redis
+  host: 127.0.0.1
+  port: 6379
+  database: "0"                     # 論理 DB 番号（文字列で指定。SELECT n でセッション中の切替も可）
+  user: ""                          # Redis ではユーザー指定なし（ACL 利用時のみ）
+  # password: "env:REDIS_PASSWORD"  # AUTH パスワード（不要なら省略）
+  # readonly: true                  # SET / DEL / FLUSH 等の書き込み系コマンドをブロック
+
 # SSH トンネル
 - name: staging
   label: stg

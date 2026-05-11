@@ -14,8 +14,9 @@ use db::{
     adapter::QueryResult,
     mysql::MysqlAdapter,
     postgres::PostgresAdapter,
+    redis::RedisAdapter,
     sqlite::SqliteAdapter,
-    AnyAdapter, LimitApplier, ReadonlyChecker,
+    AnyAdapter, LimitApplier, ReadonlyChecker, RedisReadonlyChecker,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -184,19 +185,28 @@ async fn cmd_exec(
         .find(|c| c.name() == connection_name)
         .with_context(|| format!("接続 '{}' が見つかりません", connection_name))?;
 
-    // readonly チェック
+    // readonly チェック（Redis は別ルールで判定）
+    let is_redis = matches!(conn_config.db_type(), DbType::Redis);
     if conn_config.is_readonly() {
-        ReadonlyChecker.check(&raw_query)?;
+        if is_redis {
+            RedisReadonlyChecker.check(&raw_query)?;
+        } else {
+            ReadonlyChecker.check(&raw_query)?;
+        }
     }
 
-    // LIMIT 付与
+    // LIMIT 付与（Redis は SQL ではないためスキップ）
     let effective_limit = if no_limit {
         0
     } else {
         limit_override.unwrap_or(app_config.default_limit)
     };
-    let applier = LimitApplier { default_limit: effective_limit };
-    let (final_query, auto_limited) = applier.apply(&raw_query);
+    let (final_query, auto_limited) = if is_redis {
+        (raw_query.clone(), false)
+    } else {
+        let applier = LimitApplier { default_limit: effective_limit };
+        applier.apply(&raw_query)
+    };
 
     // トンネル起動（SSH/SSM の場合）
     let mut _tunnel: Option<Box<dyn std::any::Any>> = None;
@@ -265,6 +275,9 @@ async fn cmd_exec(
                 )),
                 DbType::Mysql => {
                     AnyAdapter::Mysql(MysqlAdapter::new(host, port, database, user, password))
+                }
+                DbType::Redis => {
+                    AnyAdapter::Redis(RedisAdapter::new(host, port, database, user, password))
                 }
                 DbType::Sqlite => unreachable!("SQLite is handled in the outer match"),
             }

@@ -10,6 +10,7 @@ pub enum DbType {
     Postgresql,
     Mysql,
     Sqlite,
+    Redis,
 }
 
 impl fmt::Display for DbType {
@@ -18,6 +19,7 @@ impl fmt::Display for DbType {
             DbType::Postgresql => write!(f, "postgresql"),
             DbType::Mysql => write!(f, "mysql"),
             DbType::Sqlite => write!(f, "sqlite"),
+            DbType::Redis => write!(f, "redis"),
         }
     }
 }
@@ -29,10 +31,18 @@ impl DbType {
             DbType::Mysql => 3306,
             // SQLite はファイル接続のためポート概念なし。0 を返す
             DbType::Sqlite => 0,
+            DbType::Redis => 6379,
         }
     }
 
+    /// SQL ベースの DB かどうか（Redis 等のコマンド指向 DB は false）
+    #[allow(dead_code)]
+    pub fn is_sql(&self) -> bool {
+        !matches!(self, DbType::Redis)
+    }
+
     /// 識別子をクォートする（PostgreSQL / SQLite: "...", MySQL: `...`）
+    /// Redis は SQL ではないためそのまま返す
     pub fn quote_identifier(&self, name: &str) -> String {
         match self {
             DbType::Postgresql | DbType::Sqlite => {
@@ -54,6 +64,7 @@ impl DbType {
                     name.to_string()
                 }
             }
+            DbType::Redis => name.to_string(),
         }
     }
 }

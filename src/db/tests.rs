@@ -140,3 +140,72 @@ fn readonly_checker_blocks_lowercase_insert() {
 fn readonly_checker_allows_empty_string() {
     assert!(ReadonlyChecker.check("").is_ok());
 }
+
+// ── RedisReadonlyChecker ──
+
+#[test]
+fn redis_readonly_allows_get() {
+    assert!(RedisReadonlyChecker.check("GET foo").is_ok());
+}
+
+#[test]
+fn redis_readonly_allows_keys() {
+    assert!(RedisReadonlyChecker.check("KEYS user:*").is_ok());
+}
+
+#[test]
+fn redis_readonly_allows_hgetall() {
+    assert!(RedisReadonlyChecker.check("HGETALL myhash").is_ok());
+}
+
+#[test]
+fn redis_readonly_allows_ping() {
+    assert!(RedisReadonlyChecker.check("PING").is_ok());
+}
+
+#[test]
+fn redis_readonly_allows_select_db() {
+    // SELECT は Redis では DB 切替コマンドで書き込みではない
+    assert!(RedisReadonlyChecker.check("SELECT 0").is_ok());
+}
+
+#[test]
+fn redis_readonly_blocks_set() {
+    assert!(RedisReadonlyChecker.check("SET key val").is_err());
+}
+
+#[test]
+fn redis_readonly_blocks_del() {
+    assert!(RedisReadonlyChecker.check("DEL foo bar").is_err());
+}
+
+#[test]
+fn redis_readonly_blocks_flushdb() {
+    assert!(RedisReadonlyChecker.check("FLUSHDB").is_err());
+}
+
+#[test]
+fn redis_readonly_blocks_flushall() {
+    assert!(RedisReadonlyChecker.check("FLUSHALL").is_err());
+}
+
+#[test]
+fn redis_readonly_blocks_hset() {
+    assert!(RedisReadonlyChecker.check("HSET myhash field value").is_err());
+}
+
+#[test]
+fn redis_readonly_blocks_lowercase_del() {
+    assert!(RedisReadonlyChecker.check("del foo").is_err());
+}
+
+#[test]
+fn redis_readonly_handles_trailing_semicolon() {
+    // セミコロン付きの SET も書き込みとして弾く
+    assert!(RedisReadonlyChecker.check("SET; key val").is_err());
+}
+
+#[test]
+fn redis_readonly_allows_empty_string() {
+    assert!(RedisReadonlyChecker.check("").is_ok());
+}

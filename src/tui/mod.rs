@@ -12,8 +12,9 @@ use crate::config::connections::{ConnectionConfig, DbType};
 use crate::db::adapter::{ColumnInfo, QueryResult, TableInfo};
 use crate::db::mysql::MysqlAdapter;
 use crate::db::postgres::PostgresAdapter;
+use crate::db::redis::RedisAdapter;
 use crate::db::sqlite::SqliteAdapter;
-use crate::db::{AnyAdapter, LimitApplier, ReadonlyChecker};
+use crate::db::{AnyAdapter, LimitApplier, ReadonlyChecker, RedisReadonlyChecker};
 use crate::export::{self, ExportFormat};
 use crate::history::{HistoryEntry, HistoryStore};
 use crate::session::{ConnectionSession, SessionState, TabSnapshot};
@@ -121,6 +122,9 @@ pub enum DbTypeChoice {
     /// SQLite はトンネル不要のローカルファイル接続。
     /// 選択時は conn_type が自動的に Direct に固定される。
     Sl,
+    /// Redis はネットワーク接続（host/port）だが SQL ではないため、
+    /// クエリエディタには Redis コマンドをそのまま入力する。
+    Rd,
 }
 
 impl DbTypeChoice {
@@ -129,23 +133,26 @@ impl DbTypeChoice {
             DbTypeChoice::Pg => "pg",
             DbTypeChoice::My => "my",
             DbTypeChoice::Sl => "sqlite",
+            DbTypeChoice::Rd => "redis",
         }
     }
 
-    /// 次の選択肢へ循環（pg → my → sqlite → pg）
+    /// 次の選択肢へ循環（pg → my → sqlite → redis → pg）
     fn cycle_next(&self) -> Self {
         match self {
             DbTypeChoice::Pg => DbTypeChoice::My,
             DbTypeChoice::My => DbTypeChoice::Sl,
-            DbTypeChoice::Sl => DbTypeChoice::Pg,
+            DbTypeChoice::Sl => DbTypeChoice::Rd,
+            DbTypeChoice::Rd => DbTypeChoice::Pg,
         }
     }
 
     fn cycle_prev(&self) -> Self {
         match self {
-            DbTypeChoice::Pg => DbTypeChoice::Sl,
+            DbTypeChoice::Pg => DbTypeChoice::Rd,
             DbTypeChoice::My => DbTypeChoice::Pg,
             DbTypeChoice::Sl => DbTypeChoice::My,
+            DbTypeChoice::Rd => DbTypeChoice::Sl,
         }
     }
 
@@ -154,6 +161,7 @@ impl DbTypeChoice {
             DbTypeChoice::Pg => DbType::Postgresql,
             DbTypeChoice::My => DbType::Mysql,
             DbTypeChoice::Sl => DbType::Sqlite,
+            DbTypeChoice::Rd => DbType::Redis,
         }
     }
 
@@ -162,6 +170,7 @@ impl DbTypeChoice {
             DbTypeChoice::Pg => "5432",
             DbTypeChoice::My => "3306",
             DbTypeChoice::Sl => "",
+            DbTypeChoice::Rd => "6379",
         }
     }
 
@@ -170,6 +179,7 @@ impl DbTypeChoice {
             DbTypeChoice::Pg => "postgres",
             DbTypeChoice::My => "root",
             DbTypeChoice::Sl => "",
+            DbTypeChoice::Rd => "",
         }
     }
 
@@ -245,6 +255,7 @@ impl NewConnectionForm {
             DbType::Postgresql => DbTypeChoice::Pg,
             DbType::Mysql => DbTypeChoice::My,
             DbType::Sqlite => DbTypeChoice::Sl,
+            DbType::Redis => DbTypeChoice::Rd,
         };
 
         let mut form = Self {
@@ -462,6 +473,8 @@ pub struct ActiveConnectionInfo {
     pub name: String,
     pub label: Option<String>,
     pub readonly: bool,
+    /// Redis 接続の場合 true（SQL ではないため LIMIT 付与や SQL用 readonly チェックを抑止する）
+    pub is_redis: bool,
 }
 
 pub enum AppEvent {
@@ -975,6 +988,7 @@ impl App {
                         name: conn.name().to_string(),
                         label: conn.label().map(String::from),
                         readonly: conn.is_readonly(),
+                        is_redis: matches!(conn.db_type(), DbType::Redis),
                     });
                     self.mode = AppMode::Normal;
                     // 結果セットはクエリ再実行が必要なのでクリア（editor は session で復元済み）
@@ -1840,6 +1854,7 @@ impl App {
                                     name: conn.name().to_string(),
                                     label: conn.label().map(String::from),
                                     readonly: conn.is_readonly(),
+                                    is_redis: matches!(conn.db_type(), DbType::Redis),
                                 });
                                 self.mode = AppMode::Normal;
                                 // 接続切り替え時: 全タブの results をクリア（editor は保持）
@@ -2171,10 +2186,20 @@ impl App {
             }
         };
 
-        // readonly チェック
+        // readonly チェック（Redis は別ルールで判定）
+        let is_redis = self
+            .active_connection
+            .as_ref()
+            .map(|c| c.is_redis)
+            .unwrap_or(false);
         if let Some(ref conn_info) = self.active_connection {
             if conn_info.readonly {
-                if let Err(e) = ReadonlyChecker.check(&query) {
+                let check_result = if is_redis {
+                    RedisReadonlyChecker.check(&query)
+                } else {
+                    ReadonlyChecker.check(&query)
+                };
+                if let Err(e) = check_result {
                     self.tabs[idx].results.set_error(format!("{}", e));
                     self.status_message = Some(format!("{}", e));
                     return;
@@ -2182,11 +2207,15 @@ impl App {
             }
         }
 
-        // LIMIT 付与
-        let applier = LimitApplier {
-            default_limit: self.config.default_limit,
+        // LIMIT 付与（Redis は SQL ではないため自動 LIMIT をスキップ）
+        let (final_query, auto_limited) = if is_redis {
+            (query.clone(), false)
+        } else {
+            let applier = LimitApplier {
+                default_limit: self.config.default_limit,
+            };
+            applier.apply(&query)
         };
-        let (final_query, auto_limited) = applier.apply(&query);
 
         // 接続設定取得
         if let Some(conn) = self.connections.get(self.picker_cursor).cloned() {
@@ -2225,6 +2254,7 @@ fn build_adapter(conn: &ConnectionConfig, password: Option<String>) -> Option<An
     match db_type {
         DbType::Postgresql => Some(AnyAdapter::Postgres(PostgresAdapter::new(host, port, database, user, password))),
         DbType::Mysql => Some(AnyAdapter::Mysql(MysqlAdapter::new(host, port, database, user, password))),
+        DbType::Redis => Some(AnyAdapter::Redis(RedisAdapter::new(host, port, database, user, password))),
         DbType::Sqlite => unreachable!("SQLite is handled above"),
     }
 }
@@ -2494,6 +2524,7 @@ pub async fn run(connections: Vec<ConnectionConfig>, config: AppConfig, initial_
                 name: conn.name().to_string(),
                 label: conn.label().map(String::from),
                 readonly: conn.is_readonly(),
+                is_redis: matches!(conn.db_type(), DbType::Redis),
             });
             app.mode = AppMode::Normal;
             app.schema = SchemaState::new();
