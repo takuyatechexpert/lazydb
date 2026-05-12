@@ -5,7 +5,7 @@
 ## 特徴
 
 - **TUI**: 3ペインレイアウト（Schema Browser / Query Editor / Results）
-- **マルチ DB**: PostgreSQL / MySQL 対応
+- **マルチ DB**: PostgreSQL / MySQL / SQLite / Redis 対応
 - **複数タブ**: 接続ごとに独立した Editor / Results を複数タブで管理
 - **vim キーバインド**: Editor は Normal/Insert モーダル編集、3ペイン共通の vim 風スクロール
 - **SQL フォーマッタ**: Editor で `=` を押すとクエリ全体を整形
@@ -107,6 +107,24 @@ lazydb delete-password local
   local_port: 15433
   database: mydb
   user: postgres
+
+# SQLite（ローカルファイル）
+- type: sqlite
+  name: local-sqlite
+  label: local
+  path: ~/data/myapp.db        # `:memory:` も可
+
+# Redis
+# クエリエディタには Redis コマンドをそのまま入力する（例: `GET foo` / `HGETALL myhash`）
+- type: direct
+  name: local-redis
+  label: local
+  db_type: redis
+  host: 127.0.0.1
+  port: 6379
+  database: "0"                # 論理 DB 番号（SELECT n で切替可）
+  user: ""
+  # password: "env:REDIS_PASSWORD"
 ```
 
 ### `~/.config/lazydb/config.yml`
@@ -220,7 +238,14 @@ default_connection: local   # auto_connect 時の接続名
 - SSH トンネル使用時: `ssh` コマンド
 - SSM トンネル使用時: AWS CLI (`aws`)
 
-> **Note:** PostgreSQL / MySQL への接続はネイティブドライバ（sqlx）を使用するため、`psql` や `mysql` コマンドのインストールは不要です。
+> **Note:** PostgreSQL / MySQL / SQLite / Redis への接続はすべてネイティブドライバを使用するため、`psql` / `mysql` / `redis-cli` 等のクライアントコマンドのインストールは不要です。
+
+### Redis 利用時のメモ
+
+- クエリエディタには Redis コマンドをそのまま入力（例: `GET foo` / `KEYS user:*` / `HGETALL myhash` / `SELECT 0`）
+- サイドバーには論理 DB 番号（`db0`〜）が表示され、選択すると `SCAN` でサンプルキーを取得
+- `readonly: true` で `SET` / `DEL` / `FLUSHDB` / `HSET` 等の書き込み系コマンドをブロック（`GET` / `KEYS` / `SELECT n` は許可）
+- 結果整形: `HGETALL` / `HMGET` / `CONFIG GET` は field/value のペア表、その他配列は idx/value 表として表示
 
 ## ライセンス
 
