@@ -241,7 +241,7 @@ pub fn render_export_format(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
-    let formats = ["CSV", "JSON"];
+    let formats = ["CSV", "JSON", "Clipboard"];
     let items: Vec<ListItem> = formats
         .iter()
         .enumerate()

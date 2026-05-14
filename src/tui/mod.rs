@@ -2111,22 +2111,45 @@ impl App {
     }
 
     fn handle_export_format_key(&mut self, key: KeyEvent) -> std::ops::ControlFlow<()> {
+        // Format picker のエントリ数（CSV / JSON / Clipboard）
+        const FORMAT_COUNT: usize = 3;
         match key.code {
             KeyCode::Esc => {
                 self.mode = AppMode::Normal;
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                self.export_cursor = (self.export_cursor + 1) % 2;
+                self.export_cursor = (self.export_cursor + 1) % FORMAT_COUNT;
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.export_cursor = if self.export_cursor == 0 { 1 } else { 0 };
+                self.export_cursor = if self.export_cursor == 0 {
+                    FORMAT_COUNT - 1
+                } else {
+                    self.export_cursor - 1
+                };
             }
             KeyCode::Enter => {
-                let format = if self.export_cursor == 0 {
-                    ExportFormat::Csv
-                } else {
-                    ExportFormat::Json
+                let format = match self.export_cursor {
+                    0 => ExportFormat::Csv,
+                    1 => ExportFormat::Json,
+                    _ => ExportFormat::Clipboard,
                 };
+
+                // Clipboard はファイル保存を経由せず、結果テーブルをそのままコピーする。
+                if format == ExportFormat::Clipboard {
+                    let idx = self.active_tab;
+                    if let Some(ref qr) = self.tabs[idx].results.result {
+                        let text = export::to_table(qr);
+                        self.status_message = Some(match App::copy_to_clipboard(&text) {
+                            Ok(_) => format!("クリップボードにコピーしました ({} 行)", qr.rows.len()),
+                            Err(e) => format!("クリップボードへのコピーに失敗しました: {}", e),
+                        });
+                    } else {
+                        self.status_message = Some("エクスポートするクエリ結果がありません".to_string());
+                    }
+                    self.mode = AppMode::Normal;
+                    return std::ops::ControlFlow::Continue(());
+                }
+
                 self.export_format = Some(format);
                 let default_path = dirs::download_dir()
                     .unwrap_or_else(|| PathBuf::from("~/Downloads"))

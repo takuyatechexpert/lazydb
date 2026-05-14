@@ -581,6 +581,7 @@ impl EditorState {
             ..sqlformat::FormatOptions::default()
         };
         let formatted = sqlformat::format(&original, &sqlformat::QueryParams::None, &opts);
+        let formatted = insert_blank_lines_between_queries(&formatted);
         if formatted == original {
             return false;
         }
@@ -678,4 +679,34 @@ impl Scrollable for EditorState {
         let half = page_size / 2;
         self.scroll_offset = self.cursor.0.saturating_sub(half);
     }
+}
+
+/// 複数クエリを見やすくするため、`;` で終わる行の直後に空行を挿入する。
+/// - 既に空行が続く場合は何もしない
+/// - 末尾の `;` の後ろには追加しない
+pub(crate) fn insert_blank_lines_between_queries(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        out.push((*line).to_string());
+        if !line.trim_end().ends_with(';') {
+            continue;
+        }
+        // 後続に非空行が存在するか確認（末尾の`;`の後ろには追加しない）
+        let mut has_following_content = false;
+        let mut next_is_blank = false;
+        if let Some(next) = lines.get(i + 1) {
+            next_is_blank = next.trim().is_empty();
+            for l in &lines[i + 1..] {
+                if !l.trim().is_empty() {
+                    has_following_content = true;
+                    break;
+                }
+            }
+        }
+        if has_following_content && !next_is_blank {
+            out.push(String::new());
+        }
+    }
+    out.join("\n")
 }

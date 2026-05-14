@@ -9,6 +9,8 @@ mod state;
 pub use operators::{Register, YankKind};
 pub use render::render;
 use search::Search;
+#[cfg(test)]
+use state::insert_blank_lines_between_queries;
 
 // App / Panel は不要: render は EditorState を直接受け取る
 

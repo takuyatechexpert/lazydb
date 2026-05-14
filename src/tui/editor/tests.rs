@@ -328,6 +328,45 @@ fn format_buffer_undoable() {
     assert_eq!(e.lines, vec![original.to_string()]);
 }
 
+#[test]
+fn format_buffer_inserts_blank_line_between_queries() {
+    let mut e = editor_with("select 1; select 2;");
+    assert!(e.format_buffer());
+    // 1つ目のクエリ末尾の `;` の次行が空行になっていること
+    let joined = e.lines.join("\n");
+    // SELECT が2回登場する
+    assert_eq!(joined.matches("SELECT").count(), 2);
+    // `;\n\nSELECT` のパターンを含む（クエリ間に空行）
+    assert!(
+        joined.contains(";\n\nSELECT"),
+        "expected blank line between queries, got:\n{}",
+        joined
+    );
+    // 末尾の `;` 後ろには余計な空行が無い
+    assert!(joined.trim_end().ends_with(';'));
+}
+
+#[test]
+fn insert_blank_lines_no_change_when_already_separated() {
+    let input = "SELECT 1;\n\nSELECT 2;";
+    let out = insert_blank_lines_between_queries(input);
+    assert_eq!(out, input);
+}
+
+#[test]
+fn insert_blank_lines_no_trailing_blank_after_last_semicolon() {
+    let input = "SELECT 1;";
+    let out = insert_blank_lines_between_queries(input);
+    assert_eq!(out, "SELECT 1;");
+}
+
+#[test]
+fn insert_blank_lines_three_queries() {
+    let input = "SELECT 1;\nSELECT 2;\nSELECT 3;";
+    let out = insert_blank_lines_between_queries(input);
+    assert_eq!(out, "SELECT 1;\n\nSELECT 2;\n\nSELECT 3;");
+}
+
 // ── adjust_scroll (horizontal) ──
 
 #[test]

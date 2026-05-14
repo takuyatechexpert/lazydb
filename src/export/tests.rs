@@ -119,3 +119,66 @@ fn parse_json_value_string() {
 fn parse_json_value_empty_is_null() {
     assert_eq!(parse_json_value(""), serde_json::Value::Null);
 }
+
+// ── to_table ──
+
+/// テーブル出力はヘッダー行・区切り行・データ行を含み、列を ` │ ` で区切る
+#[test]
+fn to_table_outputs_header_separator_and_rows() {
+    let result = make_result(vec!["id", "name"], vec![vec!["1", "Alice"], vec!["2", "Bob"]]);
+    let table = to_table(&result);
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(lines.len(), 4, "header + sep + 2 rows: {:?}", lines);
+    assert_eq!(lines[0], " id │ name ");
+    assert_eq!(lines[1], "────┼───────");
+    assert_eq!(lines[2], " 1  │ Alice");
+    assert_eq!(lines[3], " 2  │ Bob  ");
+}
+
+/// 列幅は値側がヘッダーより広い場合、値の幅に合わせて広がる
+#[test]
+fn to_table_widens_columns_to_fit_values() {
+    let result = make_result(vec!["a"], vec![vec!["longer_value"]]);
+    let table = to_table(&result);
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(lines[0], " a           ");
+    assert_eq!(lines[1], "──────────────");
+    assert_eq!(lines[2], " longer_value");
+}
+
+/// NULL は `NULL` リテラルとして出力される（CSV の空フィールドとは異なる挙動）
+#[test]
+fn to_table_null_value_renders_as_null_literal() {
+    let result = make_result_opt(vec!["id", "name"], vec![vec![Some("1"), None]]);
+    let table = to_table(&result);
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(lines[2], " 1  │ NULL");
+}
+
+/// 空の結果（列が無い）では空文字列を返す
+#[test]
+fn to_table_no_columns_returns_empty_string() {
+    let result = make_result(vec![], vec![]);
+    let table = to_table(&result);
+    assert_eq!(table, "");
+}
+
+/// 列はあるが行が無い場合、ヘッダーと区切り線のみが出力される
+#[test]
+fn to_table_no_rows_outputs_header_and_separator_only() {
+    let result = make_result(vec!["id", "name"], vec![]);
+    let table = to_table(&result);
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(lines.len(), 2);
+    // 行が無いため `name` 列の幅はヘッダー文字列幅（4）に等しく、末尾パディングが付かない
+    assert_eq!(lines[0], " id │ name");
+    assert_eq!(lines[1], "────┼──────");
+}
+
+// ── ExportFormat ──
+
+#[test]
+fn export_format_clipboard_label_and_extension() {
+    assert_eq!(ExportFormat::Clipboard.label(), "Clipboard");
+    assert_eq!(ExportFormat::Clipboard.extension(), "txt");
+}
