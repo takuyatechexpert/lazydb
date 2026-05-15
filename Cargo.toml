@@ -1,6 +1,6 @@
 [package]
 name = "lazydb"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 description = "A standalone TUI SQL client"
 license = "MIT"
