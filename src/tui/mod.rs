@@ -475,6 +475,21 @@ pub struct ActiveConnectionInfo {
     pub readonly: bool,
     /// Redis 接続の場合 true（SQL ではないため LIMIT 付与や SQL用 readonly チェックを抑止する）
     pub is_redis: bool,
+    /// 接続時点の接続設定。クエリ実行・スキーマ取得の接続先はこれを使う。
+    /// picker_cursor はピッカーの表示位置なので、カーソルを動かして Esc で戻ると接続中の接続とずれる。
+    pub config: ConnectionConfig,
+}
+
+impl ActiveConnectionInfo {
+    pub fn new(conn: &ConnectionConfig) -> Self {
+        Self {
+            name: conn.name().to_string(),
+            label: conn.label().map(String::from),
+            readonly: conn.is_readonly(),
+            is_redis: matches!(conn.db_type(), DbType::Redis),
+            config: conn.clone(),
+        }
+    }
 }
 
 pub enum AppEvent {
@@ -589,6 +604,11 @@ impl App {
             .cloned()
             .unwrap_or_default();
         self.apply_connection_session(next_session);
+    }
+
+    /// 接続中の接続設定。未接続なら None。
+    fn active_config(&self) -> Option<&ConnectionConfig> {
+        self.active_connection.as_ref().map(|c| &c.config)
     }
 
     // ── タブ操作 ──
@@ -839,9 +859,9 @@ impl App {
     /// 指定テーブルのカラム情報がロード済みでもロード中でもなければ、
     /// fetch_columns をバックグラウンドで発行する。
     /// - schema.tables に該当テーブルが無い場合は何もしない
-    /// - active_connection が無い or ConnectionConfig が取得できない場合は何もしない
+    /// - active_connection が無い場合は何もしない
     fn maybe_auto_fetch_columns(&mut self, table: &str) {
-        let Some(conn) = self.connections.get(self.picker_cursor).cloned() else {
+        let Some(conn) = self.active_config().cloned() else {
             return;
         };
         let Some(entry) = self
@@ -984,12 +1004,7 @@ impl App {
                     if prev_name.as_deref() != Some(conn.name()) {
                         self.switch_connection_session(prev_name.as_deref(), conn.name());
                     }
-                    self.active_connection = Some(ActiveConnectionInfo {
-                        name: conn.name().to_string(),
-                        label: conn.label().map(String::from),
-                        readonly: conn.is_readonly(),
-                        is_redis: matches!(conn.db_type(), DbType::Redis),
-                    });
+                    self.active_connection = Some(ActiveConnectionInfo::new(&conn));
                     self.mode = AppMode::Normal;
                     // 結果セットはクエリ再実行が必要なのでクリア（editor は session で復元済み）
                     self.tabs.iter_mut().for_each(|t| t.results.clear());
@@ -1265,7 +1280,7 @@ impl App {
                 if let Some(result) = self.schema.toggle_expand() {
                     match result {
                         schema::ToggleResult::NeedFetchColumns(table_name) => {
-                            if let Some(conn) = self.connections.get(self.picker_cursor).cloned() {
+                            if let Some(conn) = self.active_config().cloned() {
                                 spawn_fetch_columns(&conn, &table_name, self.resolved_password.clone(), self.tx.clone());
                             }
                         }
@@ -1274,7 +1289,7 @@ impl App {
             }
             KeyCode::Char('s') => {
                 if let Some(name) = self.schema.current_table_name() {
-                    let db_type = self.connections.get(self.picker_cursor)
+                    let db_type = self.active_config()
                         .map(|c| c.db_type().clone())
                         .unwrap_or_default();
                     let quoted = quote_identifier(&name, &db_type);
@@ -1298,7 +1313,7 @@ impl App {
                 }
             }
             KeyCode::Char('r') => {
-                if let Some(conn) = self.connections.get(self.picker_cursor).cloned() {
+                if let Some(conn) = self.active_config().cloned() {
                     self.schema = SchemaState::new();
                     self.schema.loading = true;
                     self.status_message = Some("スキーマ再読み込み中...".to_string());
@@ -1850,12 +1865,7 @@ impl App {
                                 self.connections.push(conn.clone());
                                 self.picker_cursor = self.connections.len() - 1;
                                 self.resolved_password = conn.resolve_password().ok().flatten();
-                                self.active_connection = Some(ActiveConnectionInfo {
-                                    name: conn.name().to_string(),
-                                    label: conn.label().map(String::from),
-                                    readonly: conn.is_readonly(),
-                                    is_redis: matches!(conn.db_type(), DbType::Redis),
-                                });
+                                self.active_connection = Some(ActiveConnectionInfo::new(&conn));
                                 self.mode = AppMode::Normal;
                                 // 接続切り替え時: 全タブの results をクリア（editor は保持）
                                 self.tabs.iter_mut().for_each(|t| t.results.clear());
@@ -2241,7 +2251,7 @@ impl App {
         };
 
         // 接続設定取得
-        if let Some(conn) = self.connections.get(self.picker_cursor).cloned() {
+        if let Some(conn) = self.active_config().cloned() {
             self.tabs[idx].editor.executing = true;
             self.status_message = Some("クエリ実行中...".to_string());
             spawn_execute_query(&conn, &final_query, auto_limited, &query, tab_id, self.resolved_password.clone(), self.tx.clone());
@@ -2543,12 +2553,7 @@ pub async fn run(connections: Vec<ConnectionConfig>, config: AppConfig, initial_
             app.resolved_password = conn.resolve_password().ok().flatten();
             // 自動接続の場合も保存済みタブを展開する（初回接続なので prev は None）
             app.switch_connection_session(None, conn.name());
-            app.active_connection = Some(ActiveConnectionInfo {
-                name: conn.name().to_string(),
-                label: conn.label().map(String::from),
-                readonly: conn.is_readonly(),
-                is_redis: matches!(conn.db_type(), DbType::Redis),
-            });
+            app.active_connection = Some(ActiveConnectionInfo::new(&conn));
             app.mode = AppMode::Normal;
             app.schema = SchemaState::new();
             app.schema.loading = true;

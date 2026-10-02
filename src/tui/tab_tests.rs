@@ -801,3 +801,45 @@ fn paste_into_export_path_input_appends() {
 
     assert_eq!(app.export_path_input, "/tmp/out.csv");
 }
+
+// ── 接続ピッカー: カーソルを動かして Esc で戻った後の接続先 ──
+
+fn sqlite_conn(name: &str, path: &str, readonly: bool) -> ConnectionConfig {
+    ConnectionConfig::Sqlite(crate::config::connections::SqliteConfig {
+        name: name.to_string(),
+        label: None,
+        readonly,
+        path: path.to_string(),
+    })
+}
+
+#[tokio::test]
+async fn picker_esc_keeps_query_target_on_active_connection() {
+    // A は開ける DB、B は開けない DB。実行先が B にずれるとクエリが失敗する
+    let conn_a = sqlite_conn("a", ":memory:", false);
+    let conn_b = sqlite_conn("b", "/nonexistent-lazydb-test/b.db", true);
+    let (tx, mut rx) = mpsc::channel(10);
+    let mut app = App::new(vec![conn_a, conn_b], AppConfig::default(), tx);
+
+    // A に接続 → Ctrl+C でピッカー → j で B にカーソル → Esc で戻る
+    let _ = app.handle_key(key(KeyCode::Enter));
+    let _ = app.handle_key(ctrl_key('c'));
+    let _ = app.handle_key(key(KeyCode::Char('j')));
+    let _ = app.handle_key(key(KeyCode::Esc));
+    assert!(matches!(app.mode, AppMode::Normal));
+
+    let idx = app.active_tab;
+    app.tabs[idx].editor.set_content("SELECT 1");
+    let _ = app.handle_key(ctrl_key('e'));
+
+    let result = loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(AppEvent::QueryCompleted(result, ..))) => break result,
+            // A への接続時に発行された TablesLoaded は読み飛ばす
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("イベントチャネルが閉じた"),
+            Err(_) => panic!("QueryCompleted が届かない"),
+        }
+    };
+    assert!(result.is_ok(), "接続 A で実行されていない: {:?}", result.err());
+}
