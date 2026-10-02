@@ -251,10 +251,10 @@ pub fn save_all_connections(path: &Path, conns: &[ConnectionConfig]) -> Result<(
         let _ = std::fs::copy(path, &bak);
     }
 
-    // 全エントリを手書き YAML で連結
+    // 全エントリを YAML にして連結
     let mut out = String::new();
     for conn in conns {
-        out.push_str(&connection_to_yaml(conn));
+        out.push_str(&connection_to_yaml(conn)?);
     }
 
     std::fs::write(path, out)
@@ -273,8 +273,8 @@ pub fn save_connection(path: &Path, conn: &ConnectionConfig) -> Result<()> {
             .with_context(|| format!("ディレクトリを作成できません: {:?}", parent))?;
     }
 
-    // 新しい接続エントリを手書き YAML で生成（serde_yaml で全体を書き直さない）
-    let entry_yaml = connection_to_yaml(conn);
+    // 新しい接続エントリだけを YAML にする（ファイル全体は書き直さない）
+    let entry_yaml = connection_to_yaml(conn)?;
 
     // 既存ファイルの末尾に追記
     use std::io::Write;
@@ -300,111 +300,13 @@ pub fn save_connection(path: &Path, conn: &ConnectionConfig) -> Result<()> {
     Ok(())
 }
 
-/// ConnectionConfig を手書き YAML 文字列に変換（コメント保持のため serde を使わない）
-fn connection_to_yaml(conn: &ConnectionConfig) -> String {
-    match conn {
-        ConnectionConfig::Direct(c) => {
-            let mut lines = vec![
-                format!("\n- type: direct"),
-                format!("  name: {}", c.name),
-            ];
-            if let Some(ref label) = c.label {
-                lines.push(format!("  label: {}", label));
-            }
-            if c.readonly {
-                lines.push("  readonly: true".to_string());
-            }
-            if c.db_type != DbType::Postgresql {
-                lines.push(format!("  db_type: {}", c.db_type));
-            }
-            lines.push(format!("  host: {}", c.host));
-            lines.push(format!("  port: {}", c.port));
-            lines.push(format!("  database: {}", c.database));
-            lines.push(format!("  user: {}", c.user));
-            if let Some(ref pw) = c.password {
-                lines.push(format!("  password: \"{}\"", pw));
-            }
-            lines.push(String::new());
-            lines.join("\n")
-        }
-        ConnectionConfig::Ssh(c) => {
-            let mut lines = vec![
-                format!("\n- type: ssh"),
-                format!("  name: {}", c.name),
-            ];
-            if let Some(ref label) = c.label {
-                lines.push(format!("  label: {}", label));
-            }
-            if c.readonly {
-                lines.push("  readonly: true".to_string());
-            }
-            if c.db_type != DbType::Postgresql {
-                lines.push(format!("  db_type: {}", c.db_type));
-            }
-            lines.push(format!("  ssh_host: {}", c.ssh_host));
-            if let Some(ref user) = c.ssh_user {
-                lines.push(format!("  ssh_user: {}", user));
-            }
-            lines.push(format!("  remote_db_host: {}", c.remote_db_host));
-            lines.push(format!("  remote_db_port: {}", c.remote_db_port));
-            lines.push(format!("  local_port: {}", c.local_port));
-            lines.push(format!("  database: {}", c.database));
-            lines.push(format!("  user: {}", c.user));
-            if let Some(ref pw) = c.password {
-                lines.push(format!("  password: \"{}\"", pw));
-            }
-            lines.push(String::new());
-            lines.join("\n")
-        }
-        ConnectionConfig::Ssm(c) => {
-            let mut lines = vec![
-                format!("\n- type: ssm"),
-                format!("  name: {}", c.name),
-            ];
-            if let Some(ref label) = c.label {
-                lines.push(format!("  label: {}", label));
-            }
-            if c.readonly {
-                lines.push("  readonly: true".to_string());
-            }
-            if c.db_type != DbType::Postgresql {
-                lines.push(format!("  db_type: {}", c.db_type));
-            }
-            lines.push(format!("  instance_id: {}", c.instance_id));
-            lines.push(format!("  ssh_user: {}", c.ssh_user));
-            if let Some(ref key) = c.ssh_key {
-                lines.push(format!("  ssh_key: {}", key));
-            }
-            if let Some(ref profile) = c.aws_profile {
-                lines.push(format!("  aws_profile: {}", profile));
-            }
-            lines.push(format!("  remote_db_host: {}", c.remote_db_host));
-            lines.push(format!("  remote_db_port: {}", c.remote_db_port));
-            lines.push(format!("  local_port: {}", c.local_port));
-            lines.push(format!("  database: {}", c.database));
-            lines.push(format!("  user: {}", c.user));
-            if let Some(ref pw) = c.password {
-                lines.push(format!("  password: \"{}\"", pw));
-            }
-            lines.push(String::new());
-            lines.join("\n")
-        }
-        ConnectionConfig::Sqlite(c) => {
-            let mut lines = vec![
-                format!("\n- type: sqlite"),
-                format!("  name: {}", c.name),
-            ];
-            if let Some(ref label) = c.label {
-                lines.push(format!("  label: {}", label));
-            }
-            if c.readonly {
-                lines.push("  readonly: true".to_string());
-            }
-            lines.push(format!("  path: {}", c.path));
-            lines.push(String::new());
-            lines.join("\n")
-        }
-    }
+/// ConnectionConfig を connections.yml の 1 エントリ（先頭に空行を付けたシーケンス要素）に変換する
+///
+/// クォートとエスケープは serde_yaml に任せる。既定値のフィールドは `skip_serializing_if` で省く。
+fn connection_to_yaml(conn: &ConnectionConfig) -> Result<String> {
+    let yaml = serde_yaml::to_string(std::slice::from_ref(conn))
+        .with_context(|| format!("接続設定を YAML に変換できません: {}", conn.name()))?;
+    Ok(format!("\n{}", yaml))
 }
 
 /// ファイルのパーミッションを 600 (owner のみ読み書き) に設定する
@@ -436,30 +338,34 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectConfig {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub readonly: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_postgresql")]
     pub db_type: DbType,
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
     pub database: String,
     pub user: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SshConfig {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub readonly: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_postgresql")]
     pub db_type: DbType,
     /// SSH ホストまたは ~/.ssh/config の Host エイリアス
     pub ssh_host: String,
     /// SSH ユーザー（省略時は ~/.ssh/config の User を使用）
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh_user: Option<String>,
     pub remote_db_host: String,
     #[serde(default = "default_port")]
@@ -467,20 +373,24 @@ pub struct SshConfig {
     pub local_port: u16,
     pub database: String,
     pub user: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SsmConfig {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub readonly: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_postgresql")]
     pub db_type: DbType,
     pub instance_id: String,
     pub ssh_user: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub aws_profile: Option<String>,
     pub remote_db_host: String,
     #[serde(default = "default_port")]
@@ -488,6 +398,7 @@ pub struct SsmConfig {
     pub local_port: u16,
     pub database: String,
     pub user: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
 }
 
@@ -495,13 +406,23 @@ fn default_port() -> u16 {
     5432
 }
 
+// 保存時に既定値のフィールドを省くための判定（手で書いた connections.yml と同じ見た目にする）
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn is_postgresql(db_type: &DbType) -> bool {
+    *db_type == DbType::Postgresql
+}
+
 /// SQLite 接続設定。
 /// `path` はチルダ展開対応のローカルファイルパス（`:memory:` も可）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqliteConfig {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub readonly: bool,
     pub path: String,
 }
@@ -689,7 +610,7 @@ mod tests {
             readonly: true,
             path: "~/data/demo.db".into(),
         });
-        let yaml = super::connection_to_yaml(&conn);
+        let yaml = super::connection_to_yaml(&conn).unwrap();
         assert!(yaml.contains("- type: sqlite"));
         assert!(yaml.contains("name: demo"));
         assert!(yaml.contains("label: local"));
@@ -700,5 +621,70 @@ mod tests {
         let parsed: Vec<ConnectionConfig> = serde_yaml::from_str(yaml.trim_start()).unwrap();
         assert_eq!(parsed[0].name(), "demo");
         assert_eq!(parsed[0].db_type(), &DbType::Sqlite);
+    }
+
+    #[test]
+    fn save_then_load_preserves_values_needing_quotes() {
+        // YAML の記号・数値や null に見える文字列・エスケープ・改行・日本語を含む値
+        let mut conns = vec![
+            ConnectionConfig::Direct(DirectConfig {
+                name: "123".into(),
+                label: Some("a # b".into()),
+                readonly: true,
+                db_type: DbType::Mysql,
+                host: "*.example.com".into(),
+                port: 3306,
+                database: "日本語DB".into(),
+                user: "null".into(),
+                password: Some(r#"p"a\s\d\n#: x"#.into()),
+            }),
+            ConnectionConfig::Ssh(SshConfig {
+                name: "~".into(),
+                label: Some("line1\nline2".into()),
+                readonly: false,
+                db_type: DbType::Postgresql,
+                ssh_host: "host: x".into(),
+                ssh_user: Some("true".into()),
+                remote_db_host: "@db".into(),
+                remote_db_port: 5432,
+                local_port: 15432,
+                database: "%db".into(),
+                user: "'u'".into(),
+                password: Some("cr\r\ntab\t".into()),
+            }),
+            ConnectionConfig::Ssm(SsmConfig {
+                name: "[flow]".into(),
+                label: None,
+                readonly: false,
+                db_type: DbType::Redis,
+                instance_id: "{i}".into(),
+                ssh_user: "&anchor".into(),
+                ssh_key: Some("!tag".into()),
+                aws_profile: Some("- dash".into()),
+                remote_db_host: "|pipe".into(),
+                remote_db_port: 6379,
+                local_port: 16379,
+                database: "0".into(),
+                user: "".into(),
+                password: None,
+            }),
+        ];
+        // 新規作成・複製（追記）の経路
+        let appended = ConnectionConfig::Sqlite(SqliteConfig {
+            name: "メモリ".into(),
+            label: Some(">fold".into()),
+            readonly: false,
+            path: ":memory:".into(),
+        });
+
+        let dir = std::env::temp_dir().join(format!("lazydb_test_{}", uuid::Uuid::new_v4()));
+        let path = dir.join("connections.yml");
+        save_all_connections(&path, &conns).unwrap();
+        save_connection(&path, &appended).unwrap();
+        let loaded = load_connections(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        conns.push(appended);
+        assert_eq!(format!("{:?}", loaded.unwrap()), format!("{:?}", conns));
     }
 }
