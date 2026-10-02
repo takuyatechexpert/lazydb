@@ -507,6 +507,8 @@ pub struct App {
     pub mode: AppMode,
     pub active_panel: Panel,
     pub connections: Vec<ConnectionConfig>,
+    /// 接続設定の保存先。起動時に読み込んだファイル（`--connections` 指定時はそのファイル）
+    pub connections_path: PathBuf,
     pub active_connection: Option<ActiveConnectionInfo>,
     pub picker_cursor: usize,
     pub schema: SchemaState,
@@ -559,11 +561,17 @@ impl App {
         self.tabs[idx].editor.set_register(text, kind);
     }
 
-    pub fn new(connections: Vec<ConnectionConfig>, config: AppConfig, tx: mpsc::Sender<AppEvent>) -> Self {
+    pub fn new(
+        connections: Vec<ConnectionConfig>,
+        connections_path: PathBuf,
+        config: AppConfig,
+        tx: mpsc::Sender<AppEvent>,
+    ) -> Self {
         Self {
             mode: AppMode::ConnectionPicker,
             active_panel: Panel::Editor,
             connections,
+            connections_path,
             active_connection: None,
             picker_cursor: 0,
             schema: SchemaState::new(),
@@ -1846,7 +1854,9 @@ impl App {
                                     return std::ops::ControlFlow::Continue(());
                                 }
                                 self.connections[idx] = conn.clone();
-                                if let Err(e) = save_all_connections(&self.connections) {
+                                if let Err(e) =
+                                    save_all_connections(&self.connections_path, &self.connections)
+                                {
                                     self.status_message = Some(format!("保存エラー: {}", e));
                                     return std::ops::ControlFlow::Continue(());
                                 }
@@ -1858,7 +1868,7 @@ impl App {
                                 ));
                             }
                             FormMode::New | FormMode::Duplicate => {
-                                if let Err(e) = save_connection(&conn) {
+                                if let Err(e) = save_connection(&self.connections_path, &conn) {
                                     self.status_message = Some(format!("保存エラー: {}", e));
                                     return std::ops::ControlFlow::Continue(());
                                 }
@@ -2509,7 +2519,12 @@ pub fn label_color(label: &str) -> Color {
 
 // ── エントリポイント ──
 
-pub async fn run(connections: Vec<ConnectionConfig>, config: AppConfig, initial_connection: Option<&str>) -> Result<()> {
+pub async fn run(
+    connections: Vec<ConnectionConfig>,
+    connections_path: PathBuf,
+    config: AppConfig,
+    initial_connection: Option<&str>,
+) -> Result<()> {
     // パニック時にターミナルを復元するフック
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -2528,7 +2543,7 @@ pub async fn run(connections: Vec<ConnectionConfig>, config: AppConfig, initial_
 
     // App + イベントチャネル
     let (tx, mut rx) = mpsc::channel::<AppEvent>(100);
-    let mut app = App::new(connections, config.clone(), tx.clone());
+    let mut app = App::new(connections, connections_path, config.clone(), tx.clone());
 
     // 接続別セッションをインメモリへロード。
     // 実際のタブ展開は「接続が決まったタイミング」で行うため、ここでは状態だけ持っておく。

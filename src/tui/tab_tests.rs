@@ -8,7 +8,9 @@ use tokio::sync::mpsc;
 
 fn test_app() -> App {
     let (tx, _rx) = mpsc::channel(10);
-    App::new(vec![], AppConfig::default(), tx)
+    // 保存が走っても書き込めないパスにして、実際の connections.yml に触れないようにする
+    let connections_path = PathBuf::from("/nonexistent-lazydb-test/connections.yml");
+    App::new(vec![], connections_path, AppConfig::default(), tx)
 }
 
 // ── Tab::new() ──
@@ -819,7 +821,13 @@ async fn picker_esc_keeps_query_target_on_active_connection() {
     let conn_a = sqlite_conn("a", ":memory:", false);
     let conn_b = sqlite_conn("b", "/nonexistent-lazydb-test/b.db", true);
     let (tx, mut rx) = mpsc::channel(10);
-    let mut app = App::new(vec![conn_a, conn_b], AppConfig::default(), tx);
+    let connections_path = PathBuf::from("/nonexistent-lazydb-test/connections.yml");
+    let mut app = App::new(
+        vec![conn_a, conn_b],
+        connections_path,
+        AppConfig::default(),
+        tx,
+    );
 
     // A に接続 → Ctrl+C でピッカー → j で B にカーソル → Esc で戻る
     let _ = app.handle_key(key(KeyCode::Enter));
@@ -842,4 +850,44 @@ async fn picker_esc_keeps_query_target_on_active_connection() {
         }
     };
     assert!(result.is_ok(), "接続 A で実行されていない: {:?}", result.err());
+}
+
+// ── 接続の保存先: --connections で読み込んだファイルに書き戻す ──
+
+#[tokio::test]
+async fn wizard_save_writes_back_to_loaded_connections_file() {
+    use crate::config::connections::load_connections;
+
+    // デフォルト以外の接続設定ファイルを読み込んだ状態を作る
+    let dir = std::env::temp_dir().join(format!("lazydb_test_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("other.yml");
+    // 複製の保存で接続が始まるので、開けない DB にしておく（ファイルを作らない）
+    std::fs::write(
+        &path,
+        "- type: sqlite\n  name: a\n  path: /nonexistent-lazydb-test/a.db\n",
+    )
+    .unwrap();
+    let (tx, _rx) = mpsc::channel(10);
+    let mut app = App::new(
+        load_connections(&path).unwrap(),
+        path.clone(),
+        AppConfig::default(),
+        tx,
+    );
+
+    // e で a を a2 に改名して保存（全件の書き直し）→ d で a2 を複製して保存（追記）
+    let _ = app.handle_key(key(KeyCode::Char('e')));
+    app.new_conn_form.cursor = 2; // name 行
+    let _ = app.handle_key(key(KeyCode::Char('2')));
+    let _ = app.handle_key(key(KeyCode::Enter));
+    let _ = app.handle_key(key(KeyCode::Char('d')));
+    app.new_conn_form.cursor = 2;
+    let _ = app.handle_key(key(KeyCode::Enter));
+
+    let saved = load_connections(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+    let saved = saved.unwrap();
+    let names: Vec<&str> = saved.iter().map(|c| c.name()).collect();
+    assert_eq!(names, ["a2", "a2-copy"], "status: {:?}", app.status_message);
 }

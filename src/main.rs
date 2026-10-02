@@ -8,7 +8,10 @@ mod tui;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use config::{config::load_config, connections::load_connections};
+use config::{
+    config::load_config,
+    connections::{load_connections, resolve_connections_path},
+};
 use config::connections::DbType;
 use db::{
     adapter::QueryResult,
@@ -114,8 +117,16 @@ async fn main() -> Result<()> {
         }
         None => {
             let app_config = load_config(cli.config.as_deref())?;
-            let connections = load_connections(cli.connections.as_deref())?;
-            tui::run(connections, app_config, cli.connection.as_deref()).await?;
+            // TUI での保存も、読み込んだファイルへ書き戻す
+            let connections_path = resolve_connections_path(cli.connections.as_deref());
+            let connections = load_connections(&connections_path)?;
+            tui::run(
+                connections,
+                connections_path,
+                app_config,
+                cli.connection.as_deref(),
+            )
+            .await?;
         }
     }
 
@@ -138,7 +149,7 @@ fn cmd_delete_password(connection: &str) -> Result<()> {
 }
 
 async fn cmd_list_connections(connections_path: Option<&str>) -> Result<()> {
-    let connections = load_connections(connections_path)?;
+    let connections = load_connections(&resolve_connections_path(connections_path))?;
     println!("{:<20} {:<8} {:<10} {:<12}", "NAME", "LABEL", "TYPE", "DB");
     println!("{}", "-".repeat(54));
     for conn in &connections {
@@ -177,7 +188,7 @@ async fn cmd_exec(
 
     // 設定読み込み
     let app_config = load_config(config_path)?;
-    let connections = load_connections(connections_path)?;
+    let connections = load_connections(&resolve_connections_path(connections_path))?;
 
     // 接続設定を検索
     let conn_config = connections

@@ -210,21 +210,21 @@ pub fn delete_keychain_password(conn_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// connections.yml を読み込む（ファイルがなければ空リストを返す）
-pub fn load_connections(config_path: Option<&str>) -> Result<Vec<ConnectionConfig>> {
-    let path = match config_path {
-        Some(p) => expand_tilde(p),
-        None => expand_tilde("~/.config/lazydb/connections.yml"),
-    };
+/// 接続設定ファイルのパスを決める（`--connections` 未指定ならデフォルトの connections.yml）
+pub fn resolve_connections_path(config_path: Option<&str>) -> PathBuf {
+    expand_tilde(config_path.unwrap_or("~/.config/lazydb/connections.yml"))
+}
 
+/// connections.yml を読み込む（ファイルがなければ空リストを返す）
+pub fn load_connections(path: &Path) -> Result<Vec<ConnectionConfig>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
 
     // パーミッションが緩い場合は自動修正
-    ensure_secure_permissions(&path);
+    ensure_secure_permissions(path);
 
-    let content = std::fs::read_to_string(&path)
+    let content = std::fs::read_to_string(path)
         .with_context(|| format!("接続設定ファイルが見つかりません: {}", path.display()))?;
 
     let connections: Vec<ConnectionConfig> = serde_yaml::from_str(&content)
@@ -238,9 +238,7 @@ pub fn load_connections(config_path: Option<&str>) -> Result<Vec<ConnectionConfi
 /// 既存ファイルは `.bak` 拡張子でバックアップしてから上書きする。
 /// 既存ファイルにユーザーが書いていたコメントは失われるため、
 /// 安全のため `connections.yml.bak` を残す。
-pub fn save_all_connections(conns: &[ConnectionConfig]) -> Result<()> {
-    let path = expand_tilde("~/.config/lazydb/connections.yml");
-
+pub fn save_all_connections(path: &Path, conns: &[ConnectionConfig]) -> Result<()> {
     // ディレクトリ作成
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -250,7 +248,7 @@ pub fn save_all_connections(conns: &[ConnectionConfig]) -> Result<()> {
     // 既存ファイルを .bak にバックアップ
     if path.exists() {
         let bak = path.with_extension("yml.bak");
-        let _ = std::fs::copy(&path, &bak);
+        let _ = std::fs::copy(path, &bak);
     }
 
     // 全エントリを手書き YAML で連結
@@ -259,18 +257,16 @@ pub fn save_all_connections(conns: &[ConnectionConfig]) -> Result<()> {
         out.push_str(&connection_to_yaml(conn));
     }
 
-    std::fs::write(&path, out)
+    std::fs::write(path, out)
         .with_context(|| format!("接続設定ファイルに書き込めません: {}", path.display()))?;
 
-    ensure_secure_permissions(&path);
+    ensure_secure_permissions(path);
 
     Ok(())
 }
 
 /// 接続設定を connections.yml に追記する（既存内容・コメントを保持）
-pub fn save_connection(conn: &ConnectionConfig) -> Result<()> {
-    let path = expand_tilde("~/.config/lazydb/connections.yml");
-
+pub fn save_connection(path: &Path, conn: &ConnectionConfig) -> Result<()> {
     // ディレクトリ作成
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -285,12 +281,12 @@ pub fn save_connection(conn: &ConnectionConfig) -> Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(path)
         .with_context(|| format!("接続設定ファイルを開けません: {}", path.display()))?;
 
     // 既存ファイルが空でなく改行で終わっていない場合は改行を追加
     if path.exists() {
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let existing = std::fs::read_to_string(path).unwrap_or_default();
         if !existing.is_empty() && !existing.ends_with('\n') {
             writeln!(file)?;
         }
@@ -299,7 +295,7 @@ pub fn save_connection(conn: &ConnectionConfig) -> Result<()> {
     write!(file, "{}", entry_yaml)
         .with_context(|| format!("接続設定ファイルに書き込めません: {}", path.display()))?;
 
-    ensure_secure_permissions(&path);
+    ensure_secure_permissions(path);
 
     Ok(())
 }
