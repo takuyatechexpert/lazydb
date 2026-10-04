@@ -2240,7 +2240,7 @@ impl App {
                 let check_result = if is_redis {
                     RedisReadonlyChecker.check(&query)
                 } else {
-                    ReadonlyChecker.check(&query)
+                    ReadonlyChecker.check(&query, conn_info.config.db_type())
                 };
                 if let Err(e) = check_result {
                     self.tabs[idx].results.set_error(format!("{}", e));
@@ -2254,10 +2254,12 @@ impl App {
         let (final_query, auto_limited) = if is_redis {
             (query.clone(), false)
         } else {
+            // 未接続ならクエリは実行しないので、DB 種別は既定値で構わない
+            let db_type = self.active_config().map(|c| c.db_type().clone()).unwrap_or_default();
             let applier = LimitApplier {
                 default_limit: self.config.default_limit,
             };
-            applier.apply(&query)
+            applier.apply(&query, &db_type)
         };
 
         // 接続設定取得
@@ -2294,9 +2296,10 @@ fn build_adapter(conn: &ConnectionConfig, password: Option<String>) -> Option<An
         ConnectionConfig::Sqlite(_) => unreachable!("SQLite is handled above"),
     };
 
+    let readonly = conn.is_readonly();
     match db_type {
-        DbType::Postgresql => Some(AnyAdapter::Postgres(PostgresAdapter::new(host, port, database, user, password))),
-        DbType::Mysql => Some(AnyAdapter::Mysql(MysqlAdapter::new(host, port, database, user, password))),
+        DbType::Postgresql => Some(AnyAdapter::Postgres(PostgresAdapter::new(host, port, database, user, password, readonly))),
+        DbType::Mysql => Some(AnyAdapter::Mysql(MysqlAdapter::new(host, port, database, user, password, readonly))),
         DbType::Redis => Some(AnyAdapter::Redis(RedisAdapter::new(host, port, database, user, password))),
         DbType::Sqlite => unreachable!("SQLite is handled above"),
     }

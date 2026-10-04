@@ -135,6 +135,21 @@ auto_connect: false         # true: 起動時に default_connection へ自動接
 default_connection: local   # auto_connect 時の接続名
 ```
 
+### readonly 接続
+
+`readonly: true` の接続では、読み取りの文とコマンドだけを実行できます。
+それ以外は実行前に拒否します。
+
+- SQL: `SELECT` / `WITH`（CTE と本体がすべて読み取りのもの）/ `SHOW` / `EXPLAIN` / `DESCRIBE` / `VALUES` / `TABLE`（SQLite は `PRAGMA` も）。`EXPLAIN ANALYZE` は対象の文が読み取りのときだけ、`SELECT ... INTO` は拒否
+- Redis: `GET` / `KEYS` / `HGETALL` / `SCAN` / `SELECT n` などの読み取りコマンド。`SORT` / `GEORADIUS` は `STORE` 付きを拒否。一覧にないコマンド（モジュールのコマンドを含む）は拒否
+
+あわせて、DB 側でも読み取り専用にしています。
+PostgreSQL は読み取り専用トランザクションで実行し、MySQL は接続ごとにセッションを読み取り専用にし、SQLite は読み取り専用で開きます。
+
+これは操作ミスを防ぐための仕組みです。
+Redis には DB 側の読み取り専用モードがなく、PostgreSQL / MySQL でも別の接続を開いて書き込む拡張（dblink など）は防げません。
+本番環境に繋ぐ接続では、読み取り権限だけを持つ DB ユーザー（Redis は ACL の `+@read -@write`）を使ってください。
+
 ## キーバインド
 
 ### グローバル
@@ -244,7 +259,7 @@ default_connection: local   # auto_connect 時の接続名
 
 - クエリエディタには Redis コマンドをそのまま入力（例: `GET foo` / `KEYS user:*` / `HGETALL myhash` / `SELECT 0`）
 - サイドバーには論理 DB 番号（`db0`〜）が表示され、選択すると `SCAN` でサンプルキーを取得
-- `readonly: true` で `SET` / `DEL` / `FLUSHDB` / `HSET` 等の書き込み系コマンドをブロック（`GET` / `KEYS` / `SELECT n` は許可）
+- `readonly: true` では読み取りコマンドだけを実行できる（[readonly 接続](#readonly-接続) を参照）
 - 結果整形: `HGETALL` / `HMGET` / `CONFIG GET` は field/value のペア表、その他配列は idx/value 表として表示
 
 ## ライセンス

@@ -1,12 +1,14 @@
 use crate::db::adapter::{ColumnInfo, DbAdapter, QueryResult, TableInfo};
 use anyhow::{Context, Result};
 use sqlx::mysql::MySqlPoolOptions;
-use sqlx::{Column, MySqlPool, Row};
+use sqlx::{Column, Executor, MySqlPool, Row};
 use std::time::Instant;
 
 pub struct MysqlAdapter {
     pool: Option<MySqlPool>,
     connection_url: String,
+    /// readonly 接続。接続ごとにセッションを読み取り専用にする
+    readonly: bool,
 }
 
 impl MysqlAdapter {
@@ -16,6 +18,7 @@ impl MysqlAdapter {
         database: String,
         user: String,
         password: Option<String>,
+        readonly: bool,
     ) -> Self {
         let pw = password.as_deref().unwrap_or("");
         let encoded_pw = urlencoding::encode(pw);
@@ -26,14 +29,25 @@ impl MysqlAdapter {
         Self {
             pool: None,
             connection_url,
+            readonly,
         }
     }
 }
 
 impl DbAdapter for MysqlAdapter {
     async fn connect(&mut self) -> Result<()> {
-        let pool = MySqlPoolOptions::new()
-            .max_connections(2)
+        let mut pool_options = MySqlPoolOptions::new().max_connections(2);
+        if self.readonly {
+            // セッション単位で指定する。START TRANSACTION READ ONLY は
+            // DDL の暗黙コミットでトランザクションが終わり、DROP TABLE などが通ってしまう
+            pool_options = pool_options.after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    conn.execute("SET SESSION TRANSACTION READ ONLY").await?;
+                    Ok(())
+                })
+            });
+        }
+        let pool = pool_options
             .connect(&self.connection_url)
             .await
             .context("MySQL への接続に失敗しました")?;

@@ -9,6 +9,8 @@ pub struct PostgresAdapter {
     connection_url: String,
     /// 接続時の current_schema。未接続時は "public" を既定値として保持。
     schema: String,
+    /// readonly 接続。execute() を読み取り専用トランザクションで実行する
+    readonly: bool,
 }
 
 impl PostgresAdapter {
@@ -18,6 +20,7 @@ impl PostgresAdapter {
         database: String,
         user: String,
         password: Option<String>,
+        readonly: bool,
     ) -> Self {
         let pw = password.as_deref().unwrap_or("");
         let encoded_pw = urlencoding::encode(pw);
@@ -29,6 +32,7 @@ impl PostgresAdapter {
             pool: None,
             connection_url,
             schema: "public".to_string(),
+            readonly,
         }
     }
 }
@@ -67,10 +71,26 @@ impl DbAdapter for PostgresAdapter {
 
         let start = Instant::now();
 
-        let rows = sqlx::query(query)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let rows = if self.readonly {
+            // 読み取り専用トランザクションで実行し、巻き戻す。
+            // 接続パラメータ（default_transaction_read_only）での指定は、
+            // 間に挟んだコネクションプーラーに拒否・無視されることがあるので使わない
+            let mut tx = pool
+                .begin_with("BEGIN READ ONLY")
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let rows = sqlx::query(query)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            tx.rollback().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+            rows
+        } else {
+            sqlx::query(query)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?
+        };
 
         let duration_ms = start.elapsed().as_millis() as u64;
 

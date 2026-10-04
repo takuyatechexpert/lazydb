@@ -3,12 +3,15 @@ pub mod mysql;
 pub mod postgres;
 pub mod redis;
 pub mod sqlite;
+mod statement;
 
 #[cfg(test)]
 mod tests;
 
+use crate::config::connections::DbType;
 use adapter::{ColumnInfo, DbAdapter, QueryResult, TableInfo};
 use anyhow::Result;
+use statement::ReadKind;
 
 /// PostgreSQL / MySQL / SQLite / Redis を統一的に扱うアダプター enum
 pub enum AnyAdapter {
@@ -63,32 +66,30 @@ impl AnyAdapter {
     }
 }
 
-const WRITE_KEYWORDS: &[&str] = &[
-    "INSERT", "UPDATE", "DELETE", "TRUNCATE", "DROP", "CREATE", "ALTER", "RENAME", "REPLACE",
+/// readonly 接続で実行できる Redis コマンド（読み取りだけのもの）
+/// 一覧にないコマンドはすべて弾く
+const REDIS_READ_COMMANDS: &[&str] = &[
+    "EXISTS", "TYPE", "TTL", "PTTL", "EXPIRETIME", "PEXPIRETIME", "KEYS", "SCAN", "RANDOMKEY",
+    "DBSIZE", "DUMP", "OBJECT", "TOUCH", "SORT", "SORT_RO",
+    "GET", "MGET", "STRLEN", "GETRANGE", "SUBSTR", "LCS", "GETBIT", "BITCOUNT", "BITPOS",
+    "BITFIELD_RO",
+    "LRANGE", "LLEN", "LINDEX", "LPOS",
+    "SMEMBERS", "SISMEMBER", "SMISMEMBER", "SCARD", "SRANDMEMBER", "SINTER", "SINTERCARD",
+    "SUNION", "SDIFF", "SSCAN",
+    "HGET", "HMGET", "HGETALL", "HKEYS", "HVALS", "HLEN", "HEXISTS", "HSTRLEN", "HRANDFIELD",
+    "HSCAN", "HTTL", "HPTTL", "HEXPIRETIME", "HPEXPIRETIME",
+    "ZRANGE", "ZRANGEBYSCORE", "ZRANGEBYLEX", "ZREVRANGE", "ZREVRANGEBYSCORE", "ZREVRANGEBYLEX",
+    "ZSCORE", "ZMSCORE", "ZRANK", "ZREVRANK", "ZCARD", "ZCOUNT", "ZLEXCOUNT", "ZRANDMEMBER",
+    "ZSCAN", "ZINTER", "ZUNION", "ZDIFF", "ZINTERCARD",
+    "XRANGE", "XREVRANGE", "XLEN", "XREAD", "XINFO", "XPENDING",
+    "PFCOUNT",
+    "GEOPOS", "GEODIST", "GEOHASH", "GEOSEARCH", "GEORADIUS", "GEORADIUSBYMEMBER",
+    "GEORADIUS_RO", "GEORADIUSBYMEMBER_RO",
+    "PING", "ECHO", "SELECT", "INFO", "TIME", "LASTSAVE", "ROLE", "COMMAND", "MEMORY", "PUBSUB",
 ];
 
-/// Redis の書き込み系コマンド
-/// readonly 接続では先頭トークンがこの一覧に該当する場合に弾く
-const REDIS_WRITE_COMMANDS: &[&str] = &[
-    "SET", "SETEX", "SETNX", "PSETEX", "MSET", "MSETNX", "GETSET", "APPEND",
-    "DEL", "UNLINK", "RENAME", "RENAMENX", "EXPIRE", "EXPIREAT", "PEXPIRE",
-    "PEXPIREAT", "PERSIST", "MOVE", "COPY", "RESTORE",
-    "INCR", "INCRBY", "INCRBYFLOAT", "DECR", "DECRBY", "BITOP", "SETBIT", "SETRANGE",
-    "LPUSH", "RPUSH", "LPUSHX", "RPUSHX", "LPOP", "RPOP", "LSET", "LREM", "LTRIM", "LINSERT",
-    "BLPOP", "BRPOP", "BLMOVE", "RPOPLPUSH", "LMOVE",
-    "SADD", "SREM", "SPOP", "SMOVE", "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE",
-    "HSET", "HSETNX", "HMSET", "HDEL", "HINCRBY", "HINCRBYFLOAT",
-    "ZADD", "ZREM", "ZINCRBY", "ZPOPMIN", "ZPOPMAX", "BZPOPMIN", "BZPOPMAX",
-    "ZRANGESTORE", "ZINTERSTORE", "ZUNIONSTORE", "ZDIFFSTORE", "ZREMRANGEBYRANK",
-    "ZREMRANGEBYSCORE", "ZREMRANGEBYLEX",
-    "XADD", "XDEL", "XTRIM", "XGROUP", "XSETID", "XCLAIM", "XAUTOCLAIM", "XACK",
-    "PFADD", "PFMERGE",
-    "GEOADD",
-    "FLUSHDB", "FLUSHALL", "SHUTDOWN", "DEBUG", "CONFIG", "ACL", "SAVE", "BGSAVE",
-    "BGREWRITEAOF", "RESET", "FAILOVER", "REPLICAOF", "SLAVEOF", "MIGRATE",
-    "FUNCTION", "SCRIPT", "EVAL", "EVALSHA", "EVAL_RO", "EVALSHA_RO",
-    "CLIENT",
-];
+/// 引数に STORE / STOREDIST を付けると、結果をキーに書き込む読み取りコマンド
+const REDIS_STORE_OPTION_COMMANDS: &[&str] = &["SORT", "GEORADIUS", "GEORADIUSBYMEMBER"];
 
 /// SELECT 文に LIMIT がない場合に自動付与する
 pub struct LimitApplier {
@@ -97,28 +98,26 @@ pub struct LimitApplier {
 
 impl LimitApplier {
     /// クエリに LIMIT を付与する。付与した場合は true を返す
-    pub fn apply(&self, query: &str) -> (String, bool) {
+    pub fn apply(&self, query: &str, db_type: &DbType) -> (String, bool) {
         if self.default_limit == 0 {
+            return (query.to_string(), false);
+        }
+
+        // SELECT の文 1 つだけが対象（WITH の本体が SELECT のものを含む）。
+        // WITH ... DELETE に付けると、PostgreSQL では構文エラー、MySQL では削除件数の制限になる
+        if statement::classify(query, db_type) != Ok(vec![ReadKind::Select]) {
             return (query.to_string(), false);
         }
 
         let trimmed = query.trim();
         let upper = trimmed.to_uppercase();
 
-        // SELECT / WITH で始まるクエリのみ対象
-        if !upper.starts_with("SELECT") && !upper.starts_with("WITH") {
-            return (query.to_string(), false);
-        }
-
         // フォーマット済みクエリ（改行を含む）でも検出できるよう、
         // 連続する空白類をすべて単一スペースに正規化してから判定する
         let normalized = format!(" {} ", upper.split_whitespace().collect::<Vec<_>>().join(" "));
 
-        // すでに LIMIT / FETCH FIRST / TOP がある場合はスキップ
-        if normalized.contains(" LIMIT ")
-            || normalized.contains(" FETCH FIRST ")
-            || normalized.contains(" TOP ")
-        {
+        // すでに LIMIT / FETCH FIRST がある場合はスキップ
+        if normalized.contains(" LIMIT ") || normalized.contains(" FETCH FIRST ") {
             return (query.to_string(), false);
         }
 
@@ -128,22 +127,16 @@ impl LimitApplier {
     }
 }
 
-/// readonly 接続で書き込みクエリをブロックする
+/// readonly 接続で、読み取り以外の文をブロックする
+///
+/// 読み取りの文だけを通す許可リスト方式。
+/// 本当のガードは DB 側の読み取り専用化（各アダプター）で、ここは実行前に分かりやすいエラーを出すための判定。
 pub struct ReadonlyChecker;
 
 impl ReadonlyChecker {
-    pub fn check(&self, query: &str) -> Result<()> {
-        let first_word = query
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_uppercase();
-
-        if WRITE_KEYWORDS.contains(&first_word.as_str()) {
-            anyhow::bail!(
-                "読み取り専用接続では '{}' を実行できません",
-                first_word
-            );
+    pub fn check(&self, query: &str, db_type: &DbType) -> Result<()> {
+        if let Err(keyword) = statement::classify(query, db_type) {
+            anyhow::bail!("読み取り専用接続では '{}' を実行できません", keyword);
         }
         Ok(())
     }
@@ -151,23 +144,32 @@ impl ReadonlyChecker {
 
 /// Redis 用の readonly チェッカー
 ///
-/// 先頭トークンを大文字化して `REDIS_WRITE_COMMANDS` と照合する。
-/// セミコロン末尾やクォートはトークナイザに任せず、先頭ワードのみで判定すれば十分。
+/// 読み取りコマンドの許可リスト方式。
+/// コマンド名は実行時と同じトークナイザで取り出す（`"DEL" foo` もクォートが外れて DEL として実行されるため）。
 pub struct RedisReadonlyChecker;
 
 impl RedisReadonlyChecker {
     pub fn check(&self, query: &str) -> Result<()> {
-        let first_word = query
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_end_matches(';')
-            .to_uppercase();
+        let tokens = self::redis::tokenize(query)?;
+        let Some(command) = tokens.first() else {
+            return Ok(());
+        };
+        let command = command.to_uppercase();
 
-        if REDIS_WRITE_COMMANDS.contains(&first_word.as_str()) {
+        if !REDIS_READ_COMMANDS.contains(&command.as_str()) {
             anyhow::bail!(
                 "読み取り専用接続では Redis コマンド '{}' を実行できません",
-                first_word
+                command
+            );
+        }
+        if REDIS_STORE_OPTION_COMMANDS.contains(&command.as_str())
+            && tokens[1..].iter().any(|arg| {
+                arg.eq_ignore_ascii_case("STORE") || arg.eq_ignore_ascii_case("STOREDIST")
+            })
+        {
+            anyhow::bail!(
+                "読み取り専用接続では Redis コマンド '{} ... STORE' を実行できません",
+                command
             );
         }
         Ok(())

@@ -202,7 +202,7 @@ async fn cmd_exec(
         if is_redis {
             RedisReadonlyChecker.check(&raw_query)?;
         } else {
-            ReadonlyChecker.check(&raw_query)?;
+            ReadonlyChecker.check(&raw_query, conn_config.db_type())?;
         }
     }
 
@@ -216,7 +216,7 @@ async fn cmd_exec(
         (raw_query.clone(), false)
     } else {
         let applier = LimitApplier { default_limit: effective_limit };
-        applier.apply(&raw_query)
+        applier.apply(&raw_query, conn_config.db_type())
     };
 
     // トンネル起動（SSH/SSM の場合）
@@ -280,13 +280,14 @@ async fn cmd_exec(
                 config::connections::ConnectionConfig::Sqlite(_) => unreachable!(),
             };
 
+            let readonly = conn_config.is_readonly();
             match db_type {
                 DbType::Postgresql => AnyAdapter::Postgres(PostgresAdapter::new(
-                    host, port, database, user, password,
+                    host, port, database, user, password, readonly,
                 )),
-                DbType::Mysql => {
-                    AnyAdapter::Mysql(MysqlAdapter::new(host, port, database, user, password))
-                }
+                DbType::Mysql => AnyAdapter::Mysql(MysqlAdapter::new(
+                    host, port, database, user, password, readonly,
+                )),
                 DbType::Redis => {
                     AnyAdapter::Redis(RedisAdapter::new(host, port, database, user, password))
                 }
