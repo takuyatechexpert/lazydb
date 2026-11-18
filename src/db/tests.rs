@@ -240,6 +240,50 @@ fn readonly_checker_allows_pragma_on_sqlite() {
     assert!(ReadonlyChecker.check("PRAGMA table_info(users)", SQLITE).is_ok());
 }
 
+// ── TransactionChecker ──
+
+#[test]
+fn transaction_checker_blocks_only_transaction_control() {
+    let blocked: &[(&str, &DbType)] = &[
+        ("BEGIN", PG),
+        ("begin work", MYSQL),
+        ("BEGIN IMMEDIATE", SQLITE),
+        ("START TRANSACTION READ WRITE", MYSQL),
+        ("START TRANSACTION", PG),
+        ("COMMIT", PG),
+        ("COMMIT", MYSQL),
+        ("COMMIT", SQLITE),
+        ("ROLLBACK", PG),
+        ("ROLLBACK TO SAVEPOINT s1", MYSQL),
+        ("ROLLBACK", SQLITE),
+        ("SAVEPOINT s1", PG),
+        ("SAVEPOINT s1", MYSQL),
+        ("SAVEPOINT s1", SQLITE),
+        // 先頭のコメント・複数の文・MySQL の実行コメント
+        ("-- 開始\nBEGIN", PG),
+        ("/* x */ BEGIN", SQLITE),
+        ("SELECT 1; BEGIN", PG),
+        ("/*!50000 BEGIN */", MYSQL),
+    ];
+    for (query, db_type) in blocked {
+        assert!(TransactionChecker.check(query, db_type).is_err(), "{query}");
+    }
+
+    let allowed: &[(&str, &DbType)] = &[
+        ("SELECT 'BEGIN'", PG),
+        ("SELECT commit FROM t", MYSQL),
+        ("UPDATE users SET name = 'x'", PG),
+        ("START REPLICA", MYSQL),
+        ("DO $$ BEGIN PERFORM 1; END $$", PG),
+        // 2 相コミットは準備済みのトランザクションを名前で指すので、別の接続からでも効く
+        ("COMMIT PREPARED 'tx1'", PG),
+        ("ROLLBACK PREPARED 'tx1'", PG),
+    ];
+    for (query, db_type) in allowed {
+        assert!(TransactionChecker.check(query, db_type).is_ok(), "{query}");
+    }
+}
+
 // ── RedisReadonlyChecker ──
 
 #[test]

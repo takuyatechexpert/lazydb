@@ -14,7 +14,9 @@ use crate::db::mysql::MysqlAdapter;
 use crate::db::postgres::PostgresAdapter;
 use crate::db::redis::RedisAdapter;
 use crate::db::sqlite::SqliteAdapter;
-use crate::db::{AnyAdapter, LimitApplier, ReadonlyChecker, RedisReadonlyChecker};
+use crate::db::{
+    AnyAdapter, LimitApplier, ReadonlyChecker, RedisReadonlyChecker, TransactionChecker,
+};
 use crate::export::{self, ExportFormat};
 use crate::history::{HistoryEntry, HistoryStore};
 use crate::session::{ConnectionSession, SessionState, TabSnapshot};
@@ -2230,24 +2232,30 @@ impl App {
             }
         };
 
-        // readonly チェック（Redis は別ルールで判定）
+        // 実行前のチェック（Redis は別ルールで判定）
         let is_redis = self
             .active_connection
             .as_ref()
             .map(|c| c.is_redis)
             .unwrap_or(false);
         if let Some(ref conn_info) = self.active_connection {
-            if conn_info.readonly {
-                let check_result = if is_redis {
-                    RedisReadonlyChecker.check(&query)
-                } else {
-                    ReadonlyChecker.check(&query, conn_info.config.db_type())
-                };
-                if let Err(e) = check_result {
-                    self.tabs[idx].results.set_error(format!("{}", e));
-                    self.status_message = Some(format!("{}", e));
-                    return;
-                }
+            let db_type = conn_info.config.db_type();
+            let check_result = match (is_redis, conn_info.readonly) {
+                (true, true) => RedisReadonlyChecker.check(&query),
+                (true, false) => Ok(()),
+                // トランザクション制御文は readonly でなくても拒否する
+                (false, readonly) => TransactionChecker.check(&query, db_type).and_then(|()| {
+                    if readonly {
+                        ReadonlyChecker.check(&query, db_type)
+                    } else {
+                        Ok(())
+                    }
+                }),
+            };
+            if let Err(e) = check_result {
+                self.tabs[idx].results.set_error(format!("{}", e));
+                self.status_message = Some(format!("{}", e));
+                return;
             }
         }
 

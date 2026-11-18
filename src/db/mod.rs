@@ -142,6 +142,26 @@ impl ReadonlyChecker {
     }
 }
 
+/// TUI で、トランザクション制御文（BEGIN / START TRANSACTION / COMMIT / ROLLBACK / SAVEPOINT）をブロックする
+///
+/// TUI はクエリごとに新しい接続で実行して捨てるので、BEGIN で始めたトランザクションは次のクエリに引き継がれない。
+/// 次の UPDATE は別の接続で自動コミットされ、ROLLBACK で戻せない。
+/// CLI は 1 回の実行に書いた文を同じ接続で流すので、`BEGIN; ...; COMMIT;` が効く。CLI には使わない。
+/// 恒久対応は接続の再利用。
+pub struct TransactionChecker;
+
+impl TransactionChecker {
+    pub fn check(&self, query: &str, db_type: &DbType) -> Result<()> {
+        if let Some(keyword) = statement::transaction_control(query, db_type) {
+            anyhow::bail!(
+                "lazydb はクエリごとに別の接続で実行するため、トランザクションを維持できません（'{}' は実行しません）",
+                keyword
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Redis 用の readonly チェッカー
 ///
 /// 読み取りコマンドの許可リスト方式。

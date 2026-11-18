@@ -852,6 +852,32 @@ async fn picker_esc_keeps_query_target_on_active_connection() {
     assert!(result.is_ok(), "接続 A で実行されていない: {:?}", result.err());
 }
 
+// ── トランザクション制御文: readonly でない接続でも実行前に拒否する ──
+
+#[tokio::test]
+async fn begin_is_rejected_on_writable_connection() {
+    let (tx, _rx) = mpsc::channel(10);
+    let connections_path = PathBuf::from("/nonexistent-lazydb-test/connections.yml");
+    let mut app = App::new(
+        vec![sqlite_conn("a", ":memory:", false)],
+        connections_path,
+        AppConfig::default(),
+        tx,
+    );
+    let _ = app.handle_key(key(KeyCode::Enter));
+
+    let idx = app.active_tab;
+    app.tabs[idx].editor.set_content("BEGIN");
+    let _ = app.handle_key(ctrl_key('e'));
+
+    assert!(!app.tabs[idx].editor.executing, "BEGIN が実行された");
+    let status = app.status_message.unwrap_or_default();
+    assert!(
+        status.contains("トランザクションを維持できません"),
+        "status: {status}"
+    );
+}
+
 // ── 接続の保存先: --connections で読み込んだファイルに書き戻す ──
 
 #[tokio::test]

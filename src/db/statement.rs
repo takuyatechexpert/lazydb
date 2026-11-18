@@ -1,6 +1,7 @@
 //! SQL 文の種類の判定
 //!
-//! readonly 接続のガード（`ReadonlyChecker`）と自動 LIMIT（`LimitApplier`）が同じ判定を使う。
+//! readonly 接続のガード（`ReadonlyChecker`）、自動 LIMIT（`LimitApplier`）、
+//! トランザクション制御文のガード（`TransactionChecker`）が同じ字句解析を使う。
 //! 文字列とコメントの区切り方は DB ごとに違うので、方言に合わせて字句に分けてから判定する。
 //! 判定できない形は読み取りではないものとして扱う（書き込みを見落とすより、読み取りを拒否する側に倒す）。
 
@@ -26,6 +27,34 @@ pub fn classify(query: &str, db_type: &DbType) -> Result<Vec<ReadKind>, String> 
         .filter(|statement| !statement.is_empty())
         .map(|statement| classify_statement(statement, dialect))
         .collect()
+}
+
+/// トランザクションを始める・終える文の先頭の語。START は TRANSACTION が続くときだけ対象にする
+const TRANSACTION_KEYWORDS: &[&str] = &["BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT"];
+
+/// クエリにトランザクション制御文があれば、その文を表す語（`BEGIN` など）を返す。
+pub fn transaction_control(query: &str, db_type: &DbType) -> Option<String> {
+    let dialect = Dialect::of(db_type);
+    tokenize(query, dialect)
+        .split(|t| *t == Token::Semicolon)
+        .find_map(transaction_control_statement)
+}
+
+fn transaction_control_statement(tokens: &[Token]) -> Option<String> {
+    let Some(Token::Word(keyword)) = tokens.first() else {
+        return None;
+    };
+    let next = tokens.get(1);
+    match keyword.as_str() {
+        // MySQL の START REPLICA などは対象外
+        "START" if next.is_some_and(|t| is_word(t, "TRANSACTION")) => {
+            Some("START TRANSACTION".to_string())
+        }
+        // PostgreSQL の 2 相コミットは、準備済みのトランザクションを名前で指すので別の接続からでも効く
+        "COMMIT" | "ROLLBACK" if next.is_some_and(|t| is_word(t, "PREPARED")) => None,
+        k if TRANSACTION_KEYWORDS.contains(&k) => Some(k.to_string()),
+        _ => None,
+    }
 }
 
 /// 文字列・コメントの区切り方の違い
