@@ -142,12 +142,14 @@ impl ConnectionConfig {
     }
 
     /// TUI 用のパスワード解決。`prompt` は入力を求めずにエラーを返し、それ以外は resolve_password と同じ。
-    /// raw mode の TUI で対話入力すると Enter が `\r` になって `\n` が届かず、TUI ごと止まるため。
+    /// TUI 内で rpassword に入力させると、Enter・Ctrl+Q・Ctrl+J のどれでも抜けられず TUI ごと止まる（tmux で確認）。
+    /// raw mode で Enter が `\r` になることと、キー入力を読むタスクが同じ端末を読むことが原因とみられる（未確定）。
     pub fn resolve_password_in_tui(&self) -> Result<Option<String>> {
         if self.password_field() == Some("prompt") {
+            // ステータス行は 1 行で切れるので、直し方（keychain:NAME）を前に置く
             anyhow::bail!(
-                "TUI では password: prompt に未対応です。\
-                 password: \"keychain:{name}\" にして、lazydb set-password {name} で登録してください",
+                "TUI は prompt 非対応。password を keychain:{name} にしてください\
+                 （lazydb set-password {name}）",
                 name = self.name()
             );
         }
