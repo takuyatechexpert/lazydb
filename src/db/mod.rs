@@ -146,7 +146,8 @@ impl ReadonlyChecker {
 ///
 /// TUI はクエリごとに新しい接続で実行して捨てるので、BEGIN で始めたトランザクションは次のクエリに引き継がれない。
 /// 次の UPDATE は別の接続で自動コミットされ、ROLLBACK で戻せない。
-/// CLI は 1 回の実行に書いた文を同じ接続で流すので、`BEGIN; ...; COMMIT;` が効く。CLI には使わない。
+/// CLI は 1 回の実行に書いた文をまとめて渡すので、CLI には使わない。
+/// SQLite では `BEGIN; ...; COMMIT;` が 1 つの接続で実行され、コミットもロールバックも効くことを実測した（PostgreSQL / MySQL は未測定）。
 /// 恒久対応は接続の再利用。
 pub struct TransactionChecker;
 
