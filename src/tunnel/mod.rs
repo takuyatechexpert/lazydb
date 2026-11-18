@@ -40,8 +40,8 @@ where
 ///
 /// `wait_for_port` は接続できたことだけで確立とみなすので、旧トンネルや無関係なサービスが
 /// 先に待ち受けていると、そこへ繋いだまま成功扱いになる。判定も `wait_for_port` と同じ
-/// 127.0.0.1 への connect で行う（bind での確認は、macOS では 0.0.0.0 や IPv6 で
-/// 待ち受けている相手を見逃す）。
+/// 127.0.0.1 への connect で行う（bind での確認は、macOS では 0.0.0.0 や [::] の
+/// ワイルドカードで待ち受けている相手を見逃す。どちらも 127.0.0.1 への接続を受ける）。
 pub async fn ensure_port_free(port: u16) -> Result<()> {
     if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
         bail!(
