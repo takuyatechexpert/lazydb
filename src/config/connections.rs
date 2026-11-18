@@ -140,6 +140,19 @@ impl ConnectionConfig {
         };
         resolve_password_value(raw)
     }
+
+    /// TUI 用のパスワード解決。`prompt` は入力を求めずにエラーを返し、それ以外は resolve_password と同じ。
+    /// raw mode の TUI で対話入力すると Enter が `\r` になって `\n` が届かず、TUI ごと止まるため。
+    pub fn resolve_password_in_tui(&self) -> Result<Option<String>> {
+        if self.password_field() == Some("prompt") {
+            anyhow::bail!(
+                "TUI では password: prompt に未対応です。\
+                 password: \"keychain:{name}\" にして、lazydb set-password {name} で登録してください",
+                name = self.name()
+            );
+        }
+        self.resolve_password()
+    }
 }
 
 /// パスワード値を解決する
@@ -599,6 +612,32 @@ mod tests {
         });
         assert!(conn.resolve_password().unwrap().is_none());
         assert!(conn.password_field().is_none());
+    }
+
+    #[test]
+    fn resolve_password_in_tui_rejects_prompt_without_asking() {
+        let yaml = r#"
+- name: pg
+  type: direct
+  host: 127.0.0.1
+  database: x
+  user: x
+  password: "prompt"
+- name: pg-plain
+  type: direct
+  host: 127.0.0.1
+  database: x
+  user: x
+  password: "plain"
+"#;
+        let conns: Vec<ConnectionConfig> = serde_yaml::from_str(yaml).unwrap();
+        // 入力を求めにいくと、端末があれば入力待ちで止まり、無ければ入力失敗のエラーになる
+        let err = conns[0].resolve_password_in_tui().unwrap_err().to_string();
+        assert!(err.contains("keychain:pg"), "{err}");
+        assert_eq!(
+            conns[1].resolve_password_in_tui().unwrap().as_deref(),
+            Some("plain")
+        );
     }
 
     #[test]

@@ -852,6 +852,34 @@ async fn picker_esc_keeps_query_target_on_active_connection() {
     assert!(result.is_ok(), "接続 A で実行されていない: {:?}", result.err());
 }
 
+// ── 接続ピッカー: password: prompt は TUI で入力を求めずにエラーにする ──
+
+#[test]
+fn picker_rejects_prompt_password_without_connecting() {
+    let conn = ConnectionConfig::Direct(crate::config::connections::DirectConfig {
+        name: "pg".to_string(),
+        label: None,
+        readonly: false,
+        db_type: DbType::Postgresql,
+        host: "127.0.0.1".to_string(),
+        port: 5432,
+        database: "x".to_string(),
+        user: "x".to_string(),
+        password: Some("prompt".to_string()),
+    });
+    let (tx, _rx) = mpsc::channel(10);
+    let connections_path = PathBuf::from("/nonexistent-lazydb-test/connections.yml");
+    let mut app = App::new(vec![conn], connections_path, AppConfig::default(), tx);
+
+    // 入力を求めにいくと、端末があれば入力待ちで止まり、無ければ入力失敗のエラーになる
+    let _ = app.handle_key(key(KeyCode::Enter));
+
+    assert!(matches!(app.mode, AppMode::ConnectionPicker));
+    assert!(app.active_connection.is_none());
+    let status = app.status_message.unwrap_or_default();
+    assert!(status.contains("keychain:pg"), "status: {status}");
+}
+
 // ── トランザクション制御文: readonly でない接続でも実行前に拒否する ──
 
 #[tokio::test]

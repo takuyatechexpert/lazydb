@@ -6,7 +6,7 @@
   port: 5432
   database: myapp_dev
   user: postgres
-  password: "env:PGPASSWORD"        # env:VAR / prompt / 平文
+  password: "env:PGPASSWORD"        # env:VAR / keychain:NAME / prompt（exec のみ。TUI では使えない）/ 平文
   # db_type: postgresql             # デフォルト: postgresql（省略可）
 
 # Direct 接続 (MySQL)
@@ -53,7 +53,7 @@
   local_port: 15432
   database: staging_db
   user: postgres
-  password: "prompt"                # 起動時に対話入力
+  password: "prompt"                # exec の実行時に対話入力。TUI では使えないので keychain:NAME にする
 
 # AWS SSM トンネル
 - name: production

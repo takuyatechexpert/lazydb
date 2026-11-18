@@ -71,7 +71,7 @@ lazydb delete-password local
   port: 5432
   database: mydb
   user: postgres
-  password: "keychain:local-pg"  # keychain:NAME / env:VAR / prompt / 平文
+  password: "keychain:local-pg"  # keychain:NAME / env:VAR / prompt（exec のみ）/ 平文
 
 # MySQL
 - type: direct

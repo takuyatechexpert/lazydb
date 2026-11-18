@@ -989,8 +989,8 @@ impl App {
                     return std::ops::ControlFlow::Continue(());
                 }
                 if let Some(conn) = self.connections.get(self.picker_cursor).cloned() {
-                    // パスワード解決（prompt の場合は raw mode を一時的に抜ける）
-                    let password = match conn.resolve_password() {
+                    // パスワード解決（prompt は TUI では入力できないのでエラーになる）
+                    let password = match conn.resolve_password_in_tui() {
                         Ok(pw) => pw,
                         Err(e) => {
                             self.status_message = Some(format!("パスワードエラー: {}", e));
@@ -1873,7 +1873,19 @@ impl App {
                                 }
                                 self.connections.push(conn.clone());
                                 self.picker_cursor = self.connections.len() - 1;
-                                self.resolved_password = conn.resolve_password().ok().flatten();
+                                // パスワードを解決できなければ、保存だけしてピッカーに戻る
+                                self.resolved_password = match conn.resolve_password_in_tui() {
+                                    Ok(pw) => pw,
+                                    Err(e) => {
+                                        self.mode = AppMode::ConnectionPicker;
+                                        self.status_message = Some(format!(
+                                            "接続を保存しました: {}。パスワードエラー: {}",
+                                            conn.name(),
+                                            e
+                                        ));
+                                        return std::ops::ControlFlow::Continue(());
+                                    }
+                                };
                                 self.active_connection = Some(ActiveConnectionInfo::new(&conn));
                                 self.mode = AppMode::Normal;
                                 // 接続切り替え時: 全タブの results をクリア（editor は保持）
@@ -2589,21 +2601,34 @@ pub async fn run(
         if let Some(idx) = app.connections.iter().position(|c| c.name() == conn_name) {
             app.picker_cursor = idx;
             let conn = app.connections[idx].clone();
-            app.resolved_password = conn.resolve_password().ok().flatten();
-            // 自動接続の場合も保存済みタブを展開する（初回接続なので prev は None）
-            app.switch_connection_session(None, conn.name());
-            app.active_connection = Some(ActiveConnectionInfo::new(&conn));
-            app.mode = AppMode::Normal;
-            app.schema = SchemaState::new();
-            app.schema.loading = true;
-            match &conn {
-                ConnectionConfig::Direct(_) | ConnectionConfig::Sqlite(_) => {
-                    app.status_message = Some(format!("接続中: {}...", conn.name()));
-                    spawn_fetch_tables(&conn, app.resolved_password.clone(), app.tx.clone());
+            // パスワードを解決できなければ自動接続せず、ピッカーのままエラーを表示する
+            match conn.resolve_password_in_tui() {
+                Err(e) => {
+                    app.status_message = Some(format!("パスワードエラー: {}", e));
                 }
-                ConnectionConfig::Ssh(_) | ConnectionConfig::Ssm(_) => {
-                    app.status_message = Some(format!("トンネル確立中: {}...", conn.name()));
-                    spawn_tunnel(conn, None, app.tx.clone());
+                Ok(password) => {
+                    app.resolved_password = password;
+                    // 自動接続の場合も保存済みタブを展開する（初回接続なので prev は None）
+                    app.switch_connection_session(None, conn.name());
+                    app.active_connection = Some(ActiveConnectionInfo::new(&conn));
+                    app.mode = AppMode::Normal;
+                    app.schema = SchemaState::new();
+                    app.schema.loading = true;
+                    match &conn {
+                        ConnectionConfig::Direct(_) | ConnectionConfig::Sqlite(_) => {
+                            app.status_message = Some(format!("接続中: {}...", conn.name()));
+                            spawn_fetch_tables(
+                                &conn,
+                                app.resolved_password.clone(),
+                                app.tx.clone(),
+                            );
+                        }
+                        ConnectionConfig::Ssh(_) | ConnectionConfig::Ssm(_) => {
+                            app.status_message =
+                                Some(format!("トンネル確立中: {}...", conn.name()));
+                            spawn_tunnel(conn, None, app.tx.clone());
+                        }
+                    }
                 }
             }
         }
