@@ -520,27 +520,48 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// 検索クエリにマッチする部分文字列を Yellow で強調した Span 列を返す。
-/// `needle` は事前に小文字化しておくこと。
+/// `needle` は事前に小文字化しておくこと（空文字は渡さない）。
+///
+/// マッチは `haystack.to_lowercase()` の上で探す（一覧の絞り込みと同じ判定）。
+/// 小文字化でバイト長が変わる文字（`K` U+212A → `k`、`İ` U+0130 → `i̇` など）があると、
+/// 小文字側のバイト位置は元の文字列の位置とずれるので、元の文字境界へ写してから切る。
 fn highlight_match<'a>(haystack: &'a str, needle: &str, base: Style) -> Vec<Span<'a>> {
     let lower = haystack.to_lowercase();
+    // 元の文字ごとに (小文字側の開始バイト, 元の開始バイト, 元の終了バイト)。
+    // 文字単位の小文字化と `str::to_lowercase` は、語末の Σ の扱いが違うだけで
+    // バイト長は同じ（σ も ς も 2 バイト）なので、`lower` の位置と対応する。
+    let mut map: Vec<(usize, usize, usize)> = Vec::new();
+    let mut lower_pos = 0usize;
+    for (orig_start, c) in haystack.char_indices() {
+        map.push((lower_pos, orig_start, orig_start + c.len_utf8()));
+        lower_pos += c.to_lowercase().map(char::len_utf8).sum::<usize>();
+    }
+    // 小文字側のバイト位置 `pos` を含む、元の文字の map 上の添字
+    let char_at = |pos: usize| map.partition_point(|&(lower_start, _, _)| lower_start <= pos) - 1;
+
     let mut spans: Vec<Span<'a>> = Vec::new();
     let mut last = 0usize;
     let mut search_from = 0usize;
     while let Some(rel) = lower[search_from..].find(needle) {
-        let start = search_from + rel;
-        let end = start + needle.len();
+        let m_start = search_from + rel;
+        let m_end = m_start + needle.len();
+        // 前のマッチと同じ元の文字の中から始まるときは、重ねて出さない
+        let start = map[char_at(m_start)].1.max(last);
+        let end = map[char_at(m_end - 1)].2;
         if start > last {
             spans.push(Span::styled(haystack[last..start].to_string(), base));
         }
-        spans.push(Span::styled(
-            haystack[start..end].to_string(),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-        last = end;
-        search_from = end;
+        if end > start {
+            spans.push(Span::styled(
+                haystack[start..end].to_string(),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            last = end;
+        }
+        search_from = m_end;
     }
     if last < haystack.len() {
         spans.push(Span::styled(haystack[last..].to_string(), base));
@@ -891,5 +912,28 @@ mod tests {
         s.search_query = "name".to_string();
         // "name" はカラム名のみで、テーブル名にはマッチしない
         assert!(!s.find_next());
+    }
+
+    /// ハイライト（背景 Yellow）された部分文字列を並べて返す。
+    fn highlighted(haystack: &str, needle: &str) -> Vec<String> {
+        highlight_match(haystack, needle, Style::default())
+            .into_iter()
+            .filter(|s| s.style.bg == Some(Color::Yellow))
+            .map(|s| s.content.into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn highlight_match_maps_offsets_when_lowercase_shrinks() {
+        // K（U+212A KELVIN SIGN, 3 バイト）は小文字化すると k（1 バイト）になる
+        assert_eq!(highlighted("a\u{212A}b", "b"), vec!["b"]);
+        assert_eq!(highlighted("\u{212A}elvin", "vin"), vec!["vin"]);
+    }
+
+    #[test]
+    fn highlight_match_maps_offsets_when_lowercase_grows() {
+        // İ（U+0130, 2 バイト）は小文字化すると i + U+0307（3 バイト）になる
+        assert_eq!(highlighted("\u{130}d", "d"), vec!["d"]);
+        assert_eq!(highlighted("a\u{130}", "i\u{307}"), vec!["\u{130}"]);
     }
 }

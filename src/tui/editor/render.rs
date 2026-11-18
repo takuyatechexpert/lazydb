@@ -145,10 +145,14 @@ fn render_content_lines(
                         (s_col, e_col)
                     }
                 };
-                let visible_start = sel_start_col.saturating_sub(editor.h_scroll_offset);
+                // 両端とも可視範囲に切り詰める。始点が可視範囲より右にあると
+                // 空の範囲になる（始点だけ切り詰めないと bg の長さを超えて panic する）
                 let visible_end = sel_end_col
                     .saturating_sub(editor.h_scroll_offset)
                     .min(bg.len());
+                let visible_start = sel_start_col
+                    .saturating_sub(editor.h_scroll_offset)
+                    .min(visible_end);
                 for slot in &mut bg[visible_start..visible_end] {
                     *slot = Some(Color::DarkGray);
                 }
@@ -159,10 +163,11 @@ fn render_content_lines(
         if !editor.search.query.is_empty() {
             for &(row, col, len) in &editor.search.matches {
                 if row != i { continue; }
-                let m_start = col.saturating_sub(editor.h_scroll_offset);
+                // 選択範囲と同じく、両端とも可視範囲に切り詰める
                 let m_end = (col + len)
                     .saturating_sub(editor.h_scroll_offset)
                     .min(bg.len());
+                let m_start = col.saturating_sub(editor.h_scroll_offset).min(m_end);
                 for slot in &mut bg[m_start..m_end] {
                     *slot = Some(Color::Yellow);
                 }
@@ -398,4 +403,52 @@ fn highlight_sql(line: &str) -> Vec<Span<'_>> {
     }
 
     spans
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 本文の各行から、背景が `color` の文字だけを集める（行番号と区切りの 2 span は除く）。
+    fn chars_with_bg(lines: &[Line<'static>], color: Color) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans[2..]
+                    .iter()
+                    .filter(|s| s.style.bg == Some(color))
+                    .map(|s| s.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn search_match_beyond_right_edge_is_not_drawn() {
+        // 2 つ目の zzz は 162 桁目で、幅 79 の可視範囲より右にある
+        let mut e = EditorState::new();
+        e.set_content(&format!("select zzz {} zzz", "a".repeat(150)));
+        e.search.query = "zzz".to_string();
+        e.recompute_matches();
+        e.h_scroll_offset = 0;
+
+        let lines = render_content_lines(&e, 1, 79, 1);
+
+        assert_eq!(chars_with_bg(&lines, Color::Yellow), vec!["zzz"]);
+    }
+
+    #[test]
+    fn selection_starting_beyond_right_edge_is_not_drawn() {
+        // 長い行の 156 桁目で v を押し、j で短い行へ移った状態
+        let mut e = EditorState::new();
+        e.set_content(&format!("select {}\nx", "b".repeat(150)));
+        e.mode = EditorMode::Visual;
+        e.visual_anchor = Some((0, 156));
+        e.cursor = (1, 0);
+        e.h_scroll_offset = 0;
+
+        let lines = render_content_lines(&e, 1, 79, 2);
+
+        assert_eq!(chars_with_bg(&lines, Color::DarkGray), vec!["", "x"]);
+    }
 }
