@@ -997,12 +997,8 @@ impl App {
                     };
                     self.resolved_password = password;
 
-                    // 前のトンネルを破棄
-                    if let Some(mut tunnel) = self.active_tunnel.take() {
-                        tokio::spawn(async move {
-                            tunnel.kill().await;
-                        });
-                    }
+                    // 前のトンネルを取り出す。新しい接続もトンネルなら、spawn_tunnel が終了を待ってから起動する
+                    let old_tunnel = self.active_tunnel.take();
                     // セッション切り替え: 直前の接続のタブを退避し、新接続のタブを展開する。
                     // 同じ接続を再選択した場合は何もしない（タブをそのまま維持）。
                     let prev_name = self
@@ -1020,12 +1016,13 @@ impl App {
                     self.schema.loading = true;
                     match &conn {
                         ConnectionConfig::Direct(_) | ConnectionConfig::Sqlite(_) => {
+                            kill_tunnel_in_background(old_tunnel);
                             self.status_message = Some(format!("接続中: {}...", conn.name()));
                             spawn_fetch_tables(&conn, self.resolved_password.clone(), self.tx.clone());
                         }
                         ConnectionConfig::Ssh(_) | ConnectionConfig::Ssm(_) => {
                             self.status_message = Some(format!("トンネル確立中: {}...", conn.name()));
-                            spawn_tunnel(conn, self.tx.clone());
+                            spawn_tunnel(conn, old_tunnel, self.tx.clone());
                         }
                     }
                 }
@@ -1882,8 +1879,12 @@ impl App {
                                 self.schema = SchemaState::new();
                                 self.schema.loading = true;
 
+                                // 前のトンネルを止める。残したままだと、同じ local_port の
+                                // 新しいトンネルが起動できず、クエリも旧トンネルの先へ届く
+                                let old_tunnel = self.active_tunnel.take();
                                 match &conn {
                                     ConnectionConfig::Direct(_) | ConnectionConfig::Sqlite(_) => {
+                                        kill_tunnel_in_background(old_tunnel);
                                         self.status_message =
                                             Some(format!("接続中: {}...", conn.name()));
                                         spawn_fetch_tables(
@@ -1895,7 +1896,7 @@ impl App {
                                     ConnectionConfig::Ssh(_) | ConnectionConfig::Ssm(_) => {
                                         self.status_message =
                                             Some(format!("トンネル確立中: {}...", conn.name()));
-                                        spawn_tunnel(conn, self.tx.clone());
+                                        spawn_tunnel(conn, old_tunnel, self.tx.clone());
                                     }
                                 }
                             }
@@ -2305,35 +2306,47 @@ fn build_adapter(conn: &ConnectionConfig, password: Option<String>) -> Option<An
     }
 }
 
-fn spawn_tunnel(conn: ConnectionConfig, tx: mpsc::Sender<AppEvent>) {
+fn kill_tunnel_in_background(tunnel: Option<Tunnel>) {
+    if let Some(mut tunnel) = tunnel {
+        tokio::spawn(async move {
+            tunnel.kill().await;
+        });
+    }
+}
+
+/// `old_tunnel` の終了を待ってから `conn` のトンネルを起動する
+fn spawn_tunnel(conn: ConnectionConfig, old_tunnel: Option<Tunnel>, tx: mpsc::Sender<AppEvent>) {
     tokio::spawn(async move {
-        let result = match &conn {
-            ConnectionConfig::Ssh(c) => {
-                crate::tunnel::ssh::SshTunnel::start(
-                    &c.ssh_host,
-                    c.ssh_user.as_deref(),
-                    &c.remote_db_host,
-                    c.remote_db_port,
-                    c.local_port,
-                )
-                .await
-                .map(Tunnel::Ssh)
+        let start = async {
+            match &conn {
+                ConnectionConfig::Ssh(c) => {
+                    crate::tunnel::ssh::SshTunnel::start(
+                        &c.ssh_host,
+                        c.ssh_user.as_deref(),
+                        &c.remote_db_host,
+                        c.remote_db_port,
+                        c.local_port,
+                    )
+                    .await
+                    .map(Tunnel::Ssh)
+                }
+                ConnectionConfig::Ssm(c) => {
+                    crate::tunnel::ssm::SsmTunnel::start(
+                        &c.instance_id,
+                        &c.ssh_user,
+                        c.ssh_key.as_deref(),
+                        c.aws_profile.as_deref(),
+                        &c.remote_db_host,
+                        c.remote_db_port,
+                        c.local_port,
+                    )
+                    .await
+                    .map(Tunnel::Ssm)
+                }
+                _ => unreachable!(),
             }
-            ConnectionConfig::Ssm(c) => {
-                crate::tunnel::ssm::SsmTunnel::start(
-                    &c.instance_id,
-                    &c.ssh_user,
-                    c.ssh_key.as_deref(),
-                    c.aws_profile.as_deref(),
-                    &c.remote_db_host,
-                    c.remote_db_port,
-                    c.local_port,
-                )
-                .await
-                .map(Tunnel::Ssm)
-            }
-            _ => unreachable!(),
         };
+        let result = crate::tunnel::replace(old_tunnel, start).await;
         let _ = tx.send(AppEvent::TunnelReady(Box::new((result, conn)))).await;
     });
 }
@@ -2582,7 +2595,7 @@ pub async fn run(
                 }
                 ConnectionConfig::Ssh(_) | ConnectionConfig::Ssm(_) => {
                     app.status_message = Some(format!("トンネル確立中: {}...", conn.name()));
-                    spawn_tunnel(conn, app.tx.clone());
+                    spawn_tunnel(conn, None, app.tx.clone());
                 }
             }
         }

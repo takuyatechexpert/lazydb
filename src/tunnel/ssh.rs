@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use tokio::process::{Child, Command};
 
-use super::wait_for_port;
+use super::{ensure_port_free, wait_for_port};
 
 pub struct SshTunnel {
     child: Child,
@@ -26,6 +26,8 @@ impl SshTunnel {
             Some(user) => format!("{}@{}", user, ssh_host),
             None => ssh_host.to_string(),
         };
+
+        ensure_port_free(local_port).await?;
 
         let child = Command::new("ssh")
             .arg("-L")
@@ -54,5 +56,10 @@ impl SshTunnel {
 
     pub async fn kill(&mut self) {
         let _ = self.child.kill().await;
+    }
+
+    #[cfg(test)]
+    pub(super) fn from_child(child: Child) -> Self {
+        Self { child }
     }
 }

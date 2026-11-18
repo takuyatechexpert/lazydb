@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use tokio::process::{Child, Command};
 
-use super::wait_for_port;
+use super::{ensure_port_free, wait_for_port};
 
 pub struct SsmTunnel {
     child: Child,
@@ -43,6 +43,8 @@ impl SsmTunnel {
         }
 
         cmd.arg(format!("{}@{}", ssh_user, instance_id));
+
+        ensure_port_free(local_port).await?;
 
         let child = cmd
             .stdin(std::process::Stdio::null())
