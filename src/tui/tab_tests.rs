@@ -945,3 +945,35 @@ async fn wizard_save_writes_back_to_loaded_connections_file() {
     let names: Vec<&str> = saved.iter().map(|c| c.name()).collect();
     assert_eq!(names, ["a2", "a2-copy"], "status: {:?}", app.status_message);
 }
+
+// ── 履歴ピッカー: 狭い端末でも描画できる ──
+
+#[test]
+fn history_picker_renders_in_narrow_terminal_without_panic() {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let mut app = test_app();
+    app.history_entries = vec![HistoryEntry {
+        id: "1".to_string(),
+        query: "SELECT 1".to_string(),
+        connection: "mem".to_string(),
+        executed_at: chrono::Utc::now(),
+        rows: 1,
+        duration_ms: 0,
+    }];
+
+    // 40 桁だとポップアップの内側は 26 桁になり、プレビュー幅の計算（- 30 / - 28）を下回る
+    let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+    terminal
+        .draw(|f| picker::render_history(f, &app, f.area()))
+        .unwrap();
+
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(screen.contains("[mem]"), "screen: {screen}");
+}

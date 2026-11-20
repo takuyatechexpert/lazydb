@@ -324,7 +324,8 @@ fn render_table(f: &mut Frame, results: &ResultsState, is_focused: bool, area: R
     )));
 
     // データ行（表示可能な分だけ）
-    let data_height = area.height as usize - 3; // header + sep + footer
+    // header + sep + footer。高さ 2 ではデータ行が 0 になり、ヘッダーと区切り線だけが見える
+    let data_height = (area.height as usize).saturating_sub(3);
     // ビュー先頭をクランプして cursor を可視範囲に保つ（vim 風: 通常はビュー固定、はみ出した時だけ追従）
     let cursor_row = results.scroll_offset;
     let total = results.rows.len();
@@ -670,5 +671,26 @@ mod tests {
         r.h_scroll = 20;
         Scrollable::h_page_left(&mut r);
         assert_eq!(r.h_scroll, 0);
+    }
+
+    // ── render ──
+
+    #[test]
+    fn render_with_inner_height_2_shows_header_without_panic() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let r = results_with(1, 2);
+        // 枠を除いた内側の高さが 2 になる
+        let mut terminal = Terminal::new(TestBackend::new(40, 4)).unwrap();
+        terminal.draw(|f| render(f, &r, false, f.area())).unwrap();
+
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("c0"), "screen: {screen}");
     }
 }

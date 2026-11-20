@@ -174,7 +174,7 @@ pub fn render_history(f: &mut Frame, app: &App, area: Rect) {
                 let query_preview: String = entry
                     .query
                     .chars()
-                    .take(inner.width as usize - 30)
+                    .take((inner.width as usize).saturating_sub(30))
                     .map(|c| if c == '\n' { ' ' } else { c })
                     .collect();
                 let time_str = entry.executed_at.format("%m-%d %H:%M").to_string();
@@ -182,7 +182,11 @@ pub fn render_history(f: &mut Frame, app: &App, area: Rect) {
                 let line = Line::from(vec![
                     Span::raw(prefix),
                     Span::styled(
-                        format!("{:<width$}", query_preview, width = inner.width as usize - 28),
+                        format!(
+                            "{:<width$}",
+                            query_preview,
+                            width = (inner.width as usize).saturating_sub(28)
+                        ),
                         if is_selected {
                             Style::default()
                                 .add_modifier(Modifier::BOLD)
