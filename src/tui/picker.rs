@@ -409,7 +409,7 @@ pub fn render_new_connection(f: &mut Frame, app: &App, area: Rect) {
 
         // password フィールドはマスク表示
         let display_value: String = if *label == "password" && !value.is_empty() {
-            "*".repeat(value.len())
+            "*".repeat(value.chars().count())
         } else {
             value.clone()
         };

@@ -4,8 +4,8 @@ use crate::tui::scrollable::Scrollable;
 
 use super::search::Search;
 use super::{
-    char_count, char_to_byte_idx, Completion, EditorMode, EditorSnapshot, EditorState,
-    PendingChord, SQL_KEYWORDS,
+    char_count, char_to_byte_idx, h_scroll_to_show, Completion, EditorMode, EditorSnapshot,
+    EditorState, PendingChord, SQL_KEYWORDS,
 };
 
 impl EditorState {
@@ -33,7 +33,10 @@ impl EditorState {
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
-        self.cursor = (self.lines.len() - 1, self.lines.last().map_or(0, |l| l.len()));
+        self.cursor = (
+            self.lines.len() - 1,
+            self.lines.last().map_or(0, |l| char_count(l)),
+        );
         self.redo_stack.clear();
     }
 
@@ -612,12 +615,14 @@ impl EditorState {
                 self.scroll_offset = self.cursor.0 - visible_height + 1;
             }
         }
-        // 横スクロール
+        // 横スクロール（位置は文字単位、収まるかは表示幅で判定する）
         if visible_width > 0 {
             if self.cursor.1 < self.h_scroll_offset {
                 self.h_scroll_offset = self.cursor.1;
-            } else if self.cursor.1 >= self.h_scroll_offset + visible_width {
-                self.h_scroll_offset = self.cursor.1 + 1 - visible_width;
+            } else {
+                let line = self.lines.get(self.cursor.0).map_or("", String::as_str);
+                self.h_scroll_offset =
+                    h_scroll_to_show(line, self.h_scroll_offset, self.cursor.1, visible_width);
             }
         } else {
             self.h_scroll_offset = 0;

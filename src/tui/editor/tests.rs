@@ -233,6 +233,15 @@ fn set_content_replaces_editor() {
     assert_eq!(e.cursor, (1, 11));
 }
 
+#[test]
+fn set_content_with_cjk_puts_cursor_at_line_end_so_backspace_deletes() {
+    // 履歴の挿入やクイック SELECT の経路。列がバイト長（16）だと Backspace が空振りする
+    let mut e = EditorState::new();
+    e.set_content("select 'あい';");
+    e.backspace();
+    assert_eq!(e.lines, vec!["select 'あい'"]);
+}
+
 // ── get_query_at_cursor ──
 
 #[test]
@@ -394,6 +403,27 @@ fn adjust_scroll_horizontal_no_change_when_within_view() {
     e.cursor = (0, 3);
     e.adjust_scroll(10, 10);
     assert_eq!(e.h_scroll_offset, 0);
+}
+
+#[test]
+fn adjust_scroll_horizontal_judges_cjk_line_by_display_width() {
+    // 42 文字・75 セルの行。行末のカーソル（1 セル）まで幅 65 に収めるには、
+    // 先頭の "select 'あ" 9 文字（10 セル）を飛ばしても残り 65 + カーソル 1 = 66 セルで収まらず、
+    // 「い」まで 10 文字飛ばす
+    let mut e = editor_with(&format!("select 'あいう'{}", "か".repeat(30)));
+    e.cursor = (0, 42);
+    e.adjust_scroll(10, 65);
+    assert_eq!(e.h_scroll_offset, 10);
+}
+
+// ── width_between ──
+
+#[test]
+fn width_between_counts_cjk_as_two_cells_and_past_end_as_one() {
+    // "select '" 8 + あいう 6 + "'" 1 = 15 セル
+    assert_eq!(width_between("select 'あいう'", 0, 12), 15);
+    // い・う・' のあと、行末より右の 2 列は 1 セルずつ
+    assert_eq!(width_between("select 'あいう'", 9, 14), 2 + 2 + 1 + 1 + 1);
 }
 
 // ── move_page_down ──

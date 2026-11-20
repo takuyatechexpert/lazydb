@@ -9,6 +9,7 @@ mod state;
 pub use operators::{Register, YankKind};
 pub use render::render;
 use search::Search;
+use unicode_width::UnicodeWidthChar;
 #[cfg(test)]
 use state::insert_blank_lines_between_queries;
 
@@ -151,6 +152,51 @@ pub(super) fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
         .nth(char_idx)
         .map(|(i, _)| i)
         .unwrap_or(s.len())
+}
+
+/// 1 文字の表示幅（セル数）。制御文字など幅を持たない文字は 0。
+pub(super) fn char_width(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(0)
+}
+
+/// `line` の `from` 文字目から `to` 文字目の手前までの表示幅（セル数）を返す。
+///
+/// 行末より右の列は 1 列 1 セルとして数える（Insert モードのカーソルは行末の右に立つ）。
+pub(super) fn width_between(line: &str, from: usize, to: usize) -> usize {
+    if to <= from {
+        return 0;
+    }
+    let in_line: usize = line
+        .chars()
+        .skip(from)
+        .take(to - from)
+        .map(char_width)
+        .sum();
+    let past_end = to.saturating_sub(char_count(line).max(from));
+    in_line + past_end
+}
+
+/// `col` 文字目のカーソルを表示幅 `visible_width` に収める横スクロール位置を返す。
+///
+/// 横スクロール位置は文字単位。いまの位置 `h_scroll` で収まるならそのまま返し、
+/// 収まらなければ「スクロール位置からカーソルまでの幅 + カーソル下の文字の幅」が
+/// `visible_width` 以下になるまで右へ進める。`col < h_scroll` の場合は呼び出し側で扱う。
+pub(super) fn h_scroll_to_show(
+    line: &str,
+    h_scroll: usize,
+    col: usize,
+    visible_width: usize,
+) -> usize {
+    // カーソル下の文字が幅 0（制御文字など）でも、カーソルは 1 セル占める
+    let cursor_width = width_between(line, col, col + 1).max(1);
+    let chars: Vec<char> = line.chars().collect();
+    let mut h = h_scroll;
+    let mut width = width_between(line, h, col);
+    while h < col && width + cursor_width > visible_width {
+        width -= chars.get(h).map_or(1, |&ch| char_width(ch));
+        h += 1;
+    }
+    h
 }
 
 

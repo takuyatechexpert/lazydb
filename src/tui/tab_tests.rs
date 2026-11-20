@@ -978,6 +978,41 @@ fn history_picker_renders_in_narrow_terminal_without_panic() {
     assert!(screen.contains("[mem]"), "screen: {screen}");
 }
 
+// ── 新規接続フォーム: password の伏せ字は文字数ぶん ──
+
+#[test]
+fn new_conn_form_masks_cjk_password_one_star_per_char() {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let mut app = test_app();
+    app.mode = AppMode::NewConnectionWizard;
+    app.new_conn_form = NewConnectionForm::new();
+    let password = app
+        .new_conn_form
+        .fields
+        .iter_mut()
+        .find(|(label, _)| *label == "password")
+        .expect("Direct / PostgreSQL のフォームには password 欄がある");
+    password.1 = "あいう".to_string();
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal
+        .draw(|f| picker::render_new_connection(f, &app, f.area()))
+        .unwrap();
+
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(
+        screen.contains("password          *** "),
+        "screen: {screen}"
+    );
+}
+
 // ── メインループ: エラーで抜けてもセッションを保存する ──
 
 /// 描画だけが失敗するバックエンド。stdout に書けなくなった端末（EPIPE 等）の代わりに使う

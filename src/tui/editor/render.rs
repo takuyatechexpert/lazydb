@@ -11,7 +11,9 @@ use ratatui::{
     Frame,
 };
 
-use super::{char_count, EditorMode, EditorState, SQL_KEYWORDS};
+use unicode_width::UnicodeWidthStr;
+
+use super::{char_count, char_width, width_between, EditorMode, EditorState, SQL_KEYWORDS};
 
 pub fn render(f: &mut Frame, editor: &EditorState, is_focused: bool, area: Rect) {
     let border_style = if is_focused {
@@ -71,31 +73,29 @@ pub fn render(f: &mut Frame, editor: &EditorState, is_focused: bool, area: Rect)
         render_search_bar(f, editor, bar);
     }
 
+    if !is_focused || editor.cursor.1 < editor.h_scroll_offset {
+        return;
+    }
+    // カーソルの画面座標。列は横スクロール位置からカーソルまでの表示幅で決まる
+    let inner = content_inner;
+    let line = editor.lines.get(editor.cursor.0).map_or("", String::as_str);
+    let cursor_x = inner.x
+        + line_num_width as u16
+        + 1
+        + width_between(line, editor.h_scroll_offset, editor.cursor.1) as u16;
+    let cursor_y = inner.y + editor.cursor.0.saturating_sub(editor.scroll_offset) as u16;
+
     // カーソル表示（Normal / Insert 両モード）
     // 検索バー入力中はバー側にカーソルを出すので、本文側のカーソルは出さない
-    let inner = content_inner;
-    if is_focused && !editor.search.active && editor.cursor.1 >= editor.h_scroll_offset {
-        let cursor_x = inner.x
-            + line_num_width as u16
-            + 1
-            + (editor.cursor.1 - editor.h_scroll_offset) as u16;
-        let cursor_y = inner.y + editor.cursor.0.saturating_sub(editor.scroll_offset) as u16;
-        if cursor_x < inner.x + inner.width && cursor_y < inner.y + inner.height {
-            f.set_cursor_position((cursor_x, cursor_y));
-        }
+    if !editor.search.active
+        && cursor_x < inner.x + inner.width
+        && cursor_y < inner.y + inner.height
+    {
+        f.set_cursor_position((cursor_x, cursor_y));
     }
 
     // オートコンプリート プルダウン
-    if is_focused
-        && editor.completion.active
-        && !editor.completion.candidates.is_empty()
-        && editor.cursor.1 >= editor.h_scroll_offset
-    {
-        let cursor_x = inner.x
-            + line_num_width as u16
-            + 1
-            + (editor.cursor.1 - editor.h_scroll_offset) as u16;
-        let cursor_y = inner.y + editor.cursor.0.saturating_sub(editor.scroll_offset) as u16;
+    if editor.completion.active && !editor.completion.candidates.is_empty() {
         let frame_area = f.area();
         render_completion_popup(f, editor, (cursor_x, cursor_y), frame_area);
     }
@@ -124,11 +124,15 @@ fn render_content_lines(
             Span::styled("│".to_string(), Style::default().fg(Color::DarkGray)),
         ];
 
-        // h_scroll を考慮した可視部分
+        // h_scroll を考慮した可視部分（表示幅が editor_width に収まるところまで）
+        let mut used_width = 0usize;
         let visible_str: String = line
             .chars()
             .skip(editor.h_scroll_offset)
-            .take(editor_width)
+            .take_while(|&ch| {
+                used_width += char_width(ch);
+                used_width <= editor_width
+            })
             .collect();
 
         // 文字位置 -> 背景色のマップ（可視範囲）
@@ -263,15 +267,15 @@ fn render_completion_popup(
         .completion
         .candidates
         .iter()
-        .map(|c| c.len())
+        .map(|c| UnicodeWidthStr::width(c.as_str()))
         .max()
         .unwrap_or(10)
         .max(10) as u16
         + 4;
 
-    // prefix 分だけ左にオフセット
-    let prefix_len = editor.completion.prefix.len() as u16;
-    let popup_x = cursor_x.saturating_sub(prefix_len);
+    // prefix の表示幅だけ左にオフセット
+    let prefix_width = UnicodeWidthStr::width(editor.completion.prefix.as_str()) as u16;
+    let popup_x = cursor_x.saturating_sub(prefix_width);
     let popup_y = cursor_y + 1;
     let popup_height = max_items as u16 + 2; // ボーダー分
 
@@ -450,5 +454,60 @@ mod tests {
         let lines = render_content_lines(&e, 1, 79, 2);
 
         assert_eq!(chars_with_bg(&lines, Color::DarkGray), vec!["", "x"]);
+    }
+
+    /// `editor` をフォーカスありで `width`x`height` の TestBackend に 1 フレーム描く。
+    fn draw_editor(
+        e: &EditorState,
+        width: u16,
+        height: u16,
+    ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| render(f, e, true, f.area())).unwrap();
+        terminal
+    }
+
+    #[test]
+    fn cursor_after_cjk_text_is_placed_by_display_width() {
+        // 本文の左端は x=4（枠 1 + 行番号 2 + 区切り 1）。"select 'あいう'" は 12 文字・15 セル
+        let mut e = EditorState::new();
+        e.set_content("select 'あいう'");
+
+        let mut terminal = draw_editor(&e, 40, 5);
+
+        let pos = ratatui::backend::Backend::get_cursor_position(terminal.backend_mut()).unwrap();
+        assert_eq!((pos.x, pos.y), (4 + 15, 1));
+    }
+
+    #[test]
+    fn completion_popup_for_cjk_prefix_aligns_and_fits_by_display_width() {
+        // 「顧」は x=4+14 の 2 セル。ポップアップは「顧」の左端から、" 顧客一覧表 " 12 セル + 枠 2 の幅
+        let mut e = EditorState::new();
+        e.set_content("select * from 顧");
+        e.completion.candidates = vec!["顧客一覧表".to_string()];
+        e.completion.prefix = "顧".to_string();
+        e.completion.active = true;
+
+        let terminal = draw_editor(&e, 40, 6);
+
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf[(18, 2)].symbol(), "┌");
+        assert_eq!(buf[(18 + 13, 2)].symbol(), "┐");
+    }
+
+    #[test]
+    fn visible_part_of_cjk_line_is_cut_by_display_width() {
+        // 幅 5 に全角 3 文字（6 セル）は入らない。文字数で切ると 3 文字とも入る
+        let mut e = EditorState::new();
+        e.set_content("あいう");
+
+        let lines = render_content_lines(&e, 1, 5, 1);
+
+        let text: String = lines[0].spans[2..]
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "あい");
     }
 }
