@@ -383,7 +383,7 @@ fn adjust_scroll_horizontal_when_cursor_exceeds_width() {
     let mut e = editor_with("ABCDEFGHIJ");
     e.cursor = (0, 10);
     e.adjust_scroll(10, 5); // visible_width = 5
-    // cursor.1 (10) >= h_scroll_offset (0) + 5 → h_scroll_offset = 10 + 1 - 5 = 6
+    // 行末のカーソル（1 セル）まで幅 5 に収めるには、10 + 1 - 5 = 6 文字飛ばす
     assert_eq!(e.h_scroll_offset, 6);
 }
 
@@ -414,6 +414,13 @@ fn adjust_scroll_horizontal_judges_cjk_line_by_display_width() {
     e.cursor = (0, 42);
     e.adjust_scroll(10, 65);
     assert_eq!(e.h_scroll_offset, 10);
+
+    // カーソルが全角文字の上にあるときは、その文字の 2 セルまで収める。
+    // 4 文字目の「あ」に立つと、先頭から 6 + 2 = 8 セルで幅 7 を超えるので 1 文字飛ばす
+    let mut e = editor_with("ああああ");
+    e.cursor = (0, 3);
+    e.adjust_scroll(10, 7);
+    assert_eq!(e.h_scroll_offset, 1);
 }
 
 // ── width_between ──
