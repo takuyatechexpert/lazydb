@@ -977,3 +977,73 @@ fn history_picker_renders_in_narrow_terminal_without_panic() {
         .collect();
     assert!(screen.contains("[mem]"), "screen: {screen}");
 }
+
+// ── メインループ: エラーで抜けてもセッションを保存する ──
+
+/// 描画だけが失敗するバックエンド。stdout に書けなくなった端末（EPIPE 等）の代わりに使う
+struct DrawFailsBackend(ratatui::backend::TestBackend);
+
+impl ratatui::backend::Backend for DrawFailsBackend {
+    fn draw<'a, I>(&mut self, _content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        Err(io::Error::from(io::ErrorKind::BrokenPipe))
+    }
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.0.hide_cursor()
+    }
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.0.show_cursor()
+    }
+    fn get_cursor_position(&mut self) -> io::Result<ratatui::layout::Position> {
+        self.0.get_cursor_position()
+    }
+    fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+        &mut self,
+        position: P,
+    ) -> io::Result<()> {
+        self.0.set_cursor_position(position)
+    }
+    fn clear(&mut self) -> io::Result<()> {
+        self.0.clear()
+    }
+    fn size(&self) -> io::Result<ratatui::layout::Size> {
+        self.0.size()
+    }
+    fn window_size(&mut self) -> io::Result<ratatui::backend::WindowSize> {
+        self.0.window_size()
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+#[tokio::test]
+async fn main_loop_error_still_saves_session() {
+    let dir = std::env::temp_dir().join(format!("lazydb_test_{}", uuid::Uuid::new_v4()));
+    let store = crate::session::SessionStore::with_path(dir.join("session.json"));
+    let (tx, mut rx) = mpsc::channel(10);
+    let connections_path = PathBuf::from("/nonexistent-lazydb-test/connections.yml");
+    let mut app = App::new(
+        vec![sqlite_conn("a", ":memory:", false)],
+        connections_path,
+        AppConfig::default(),
+        tx,
+    );
+    let _ = app.handle_key(key(KeyCode::Enter));
+    let idx = app.active_tab;
+    app.tabs[idx].editor.set_content("SELECT 'b14'");
+
+    let backend = DrawFailsBackend(ratatui::backend::TestBackend::new(80, 24));
+    let mut terminal = Terminal::new(backend).unwrap();
+    let result = run_main_loop_and_save(&mut terminal, &mut app, &mut rx, &store).await;
+
+    let saved = store.load();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(result.is_err(), "描画の失敗がエラーとして返っていない");
+    let session = saved
+        .get("a")
+        .expect("接続 a のセッションが保存されていない");
+    assert_eq!(session.tabs[0].content, "SELECT 'b14'");
+}

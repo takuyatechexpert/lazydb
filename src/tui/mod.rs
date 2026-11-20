@@ -6,6 +6,7 @@ pub mod picker;
 pub mod results;
 pub mod schema;
 pub mod scrollable;
+mod terminal_guard;
 
 use crate::config::config::AppConfig;
 use crate::config::connections::{ConnectionConfig, DbType};
@@ -23,15 +24,13 @@ use crate::session::{ConnectionSession, SessionState, TabSnapshot};
 use crate::tunnel::Tunnel;
 use anyhow::Result;
 use crossterm::{
-    event::{
-        DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
-    },
+    event::{DisableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::LeaveAlternateScreen,
 };
 use editor::EditorState;
 use ratatui::{
-    backend::CrosstermBackend,
+    backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -44,6 +43,7 @@ use schema::{ColumnEntry, SchemaState, TableEntry};
 use scrollable::Scrollable;
 use std::io;
 use std::path::PathBuf;
+use terminal_guard::TerminalGuard;
 use tokio::sync::mpsc;
 
 // ── タブ ──
@@ -2569,11 +2569,10 @@ pub async fn run(
         original_hook(panic_info);
     }));
 
-    // ターミナルセットアップ
-    crossterm::terminal::enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-    let backend = CrosstermBackend::new(stdout);
+    // ターミナルセットアップ。ここから先でどう抜けても、guard が端末を戻す。
+    // terminal より先に宣言し、terminal より後に drop されるようにする
+    let mut terminal_guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     terminal.hide_cursor()?;
 
@@ -2684,7 +2683,49 @@ pub async fn run(
         }
     });
 
-    // メインループ
+    let loop_result =
+        run_main_loop_and_save(&mut terminal, &mut app, &mut rx, &session_store).await;
+    // ループのエラーを優先して返す。復元のエラーを返すのは正常終了のときだけ
+    let restore_result = terminal_guard.restore();
+    loop_result?;
+    restore_result?;
+
+    Ok(())
+}
+
+/// メインループを回し、抜け方によらずセッション保存とトンネルの後始末をしてから、ループの結果を返す。
+async fn run_main_loop_and_save<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    rx: &mut mpsc::Receiver<AppEvent>,
+    session_store: &crate::session::SessionStore,
+) -> Result<()> {
+    let loop_result = run_main_loop(terminal, app, rx).await;
+
+    // 現在の接続のタブ群を取り込んでからファイルへ書き出す。
+    // active_connection が無い場合（一度も接続せず終了）はファイル更新だけ行う。
+    if let Some(name) = app.active_connection.as_ref().map(|c| c.name.clone()) {
+        let snap = app.capture_connection_session();
+        app.session_state.set(name, snap);
+    }
+    if let Err(err) = session_store.save(&app.session_state) {
+        eprintln!("session の保存に失敗しました: {}", err);
+    }
+
+    // トンネルのクリーンアップ
+    if let Some(mut tunnel) = app.active_tunnel.take() {
+        tunnel.kill().await;
+    }
+
+    loop_result
+}
+
+/// 描画とイベント処理を、終了操作かエラーまで繰り返す。
+async fn run_main_loop<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    rx: &mut mpsc::Receiver<AppEvent>,
+) -> Result<()> {
     loop {
         // スクロール調整
         let term_size = terminal.size()?;
@@ -2703,42 +2744,16 @@ pub async fn run(
         // Results パネルの表示幅を更新（右70% - ボーダー2）
         app.tabs[idx].results.visible_width = (term_width * 70 / 100).saturating_sub(2);
 
-        terminal.draw(|f| render(f, &mut app))?;
+        terminal.draw(|f| render(f, app))?;
 
         if let Some(event) = rx.recv().await {
             if app.handle_event(event).is_break() {
-                break;
+                return Ok(());
             }
         } else {
-            break;
+            return Ok(());
         }
     }
-
-    // 現在の接続のタブ群を取り込んでからファイルへ書き出す。
-    // active_connection が無い場合（一度も接続せず終了）はファイル更新だけ行う。
-    if let Some(name) = app.active_connection.as_ref().map(|c| c.name.clone()) {
-        let snap = app.capture_connection_session();
-        app.session_state.set(name, snap);
-    }
-    if let Err(err) = session_store.save(&app.session_state) {
-        eprintln!("session の保存に失敗しました: {}", err);
-    }
-
-    // トンネルのクリーンアップ
-    if let Some(mut tunnel) = app.active_tunnel.take() {
-        tunnel.kill().await;
-    }
-
-    // ターミナル復元
-    crossterm::terminal::disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableBracketedPaste,
-        LeaveAlternateScreen,
-        crossterm::cursor::Show
-    )?;
-
-    Ok(())
 }
 
 #[cfg(test)]
