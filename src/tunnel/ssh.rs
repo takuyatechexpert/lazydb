@@ -59,7 +59,7 @@ impl SshTunnel {
     }
 
     #[cfg(test)]
-    pub(super) fn from_child(child: Child) -> Self {
+    pub(crate) fn from_child(child: Child) -> Self {
         Self { child }
     }
 }

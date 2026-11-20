@@ -480,16 +480,19 @@ pub struct ActiveConnectionInfo {
     /// 接続時点の接続設定。クエリ実行・スキーマ取得の接続先はこれを使う。
     /// picker_cursor はピッカーの表示位置なので、カーソルを動かして Esc で戻ると接続中の接続とずれる。
     pub config: ConnectionConfig,
+    /// 接続の世代。接続を始めるたびに進む。非同期イベントに載せて、いまの接続が出したものかを見分ける
+    pub generation: u64,
 }
 
 impl ActiveConnectionInfo {
-    pub fn new(conn: &ConnectionConfig) -> Self {
+    pub fn new(conn: &ConnectionConfig, generation: u64) -> Self {
         Self {
             name: conn.name().to_string(),
             label: conn.label().map(String::from),
             readonly: conn.is_readonly(),
             is_redis: matches!(conn.db_type(), DbType::Redis),
             config: conn.clone(),
+            generation,
         }
     }
 }
@@ -498,10 +501,11 @@ pub enum AppEvent {
     Key(KeyEvent),
     Paste(String),
     Tick,
-    TunnelReady(Box<(Result<Tunnel>, ConnectionConfig)>),
-    TablesLoaded(Result<Vec<TableInfo>>),
-    ColumnsLoaded(String, Result<Vec<ColumnInfo>>),
-    QueryCompleted(Result<QueryResult>, bool, String, usize), // (result, auto_limited, original_query, tab_id)
+    // 末尾の u64 は、イベントを出したときの接続の世代（ActiveConnectionInfo::generation）
+    TunnelReady(Box<(Result<Tunnel>, ConnectionConfig)>, u64),
+    TablesLoaded(Result<Vec<TableInfo>>, u64),
+    ColumnsLoaded(String, Result<Vec<ColumnInfo>>, u64),
+    QueryCompleted(Result<QueryResult>, bool, String, usize, u64), // (result, auto_limited, original_query, tab_id, generation)
     ExportCompleted(Result<PathBuf>),
 }
 
@@ -545,6 +549,8 @@ pub struct App {
     /// 接続単位で永続化したタブ群のインメモリキャッシュ。
     /// 接続切替時に「直前の接続のタブ群を取り込み → 次の接続のタブ群を展開」する。
     pub session_state: SessionState,
+    /// 最後に発行した接続の世代。start_connection のたびに 1 つ進める（0 は未発行）
+    pub connection_generation: u64,
 }
 
 impl App {
@@ -597,6 +603,7 @@ impl App {
             pending_z: false,
             help_scroll: 0,
             session_state: SessionState::default(),
+            connection_generation: 0,
         }
     }
 
@@ -619,6 +626,60 @@ impl App {
     /// 接続中の接続設定。未接続なら None。
     fn active_config(&self) -> Option<&ConnectionConfig> {
         self.active_connection.as_ref().map(|c| &c.config)
+    }
+
+    /// 接続中の接続の世代。未接続なら 0（発行しない値）
+    fn active_generation(&self) -> u64 {
+        self.active_connection.as_ref().map_or(0, |c| c.generation)
+    }
+
+    /// `generation` が接続中の接続の世代か。切り替え前の接続が出したイベントなら false
+    fn is_current_generation(&self, generation: u64) -> bool {
+        self.active_connection
+            .as_ref()
+            .is_some_and(|c| c.generation == generation)
+    }
+
+    /// 接続を始める。ピッカーの Enter・ウィザードの保存・起動時の自動接続で共通の処理。
+    ///
+    /// パスワードを解決できなければ、何も変えずにエラーを返す（表示は呼び出し側で行う）。
+    /// 接続の世代を進めるので、それより前に出した非同期イベントは届いても捨てられる。
+    fn start_connection(&mut self, conn: ConnectionConfig) -> Result<()> {
+        // prompt は TUI では入力できないのでエラーになる
+        self.resolved_password = conn.resolve_password_in_tui()?;
+
+        // 前のトンネルを取り出す。新しい接続もトンネルなら、spawn_tunnel が終了を待ってから起動する
+        let old_tunnel = self.active_tunnel.take();
+        // セッション切り替え: 直前の接続のタブを退避し、新接続のタブを展開する。
+        // 同じ接続を再選択した場合は何もしない（タブをそのまま維持）。
+        let prev_name = self.active_connection.as_ref().map(|c| c.name.clone());
+        if prev_name.as_deref() != Some(conn.name()) {
+            self.switch_connection_session(prev_name.as_deref(), conn.name());
+        }
+        self.connection_generation += 1;
+        let generation = self.connection_generation;
+        self.active_connection = Some(ActiveConnectionInfo::new(&conn, generation));
+        self.mode = AppMode::Normal;
+        // 結果セットはクエリ再実行が必要なのでクリア（editor は session で復元済み）。
+        // 実行中のクエリの結果は世代が古くなって捨てられるので、実行中の表示も解除する
+        for tab in self.tabs.iter_mut() {
+            tab.results.clear();
+            tab.editor.executing = false;
+        }
+        self.schema = SchemaState::new();
+        self.schema.loading = true;
+        match &conn {
+            ConnectionConfig::Direct(_) | ConnectionConfig::Sqlite(_) => {
+                kill_tunnel_in_background(old_tunnel);
+                self.status_message = Some(format!("接続中: {}...", conn.name()));
+                spawn_fetch_tables(&conn, self.resolved_password.clone(), generation, self.tx.clone());
+            }
+            ConnectionConfig::Ssh(_) | ConnectionConfig::Ssm(_) => {
+                self.status_message = Some(format!("トンネル確立中: {}...", conn.name()));
+                spawn_tunnel(conn, old_tunnel, generation, self.tx.clone());
+            }
+        }
+        Ok(())
     }
 
     // ── タブ操作 ──
@@ -734,14 +795,19 @@ impl App {
                 }
                 std::ops::ControlFlow::Continue(())
             }
-            AppEvent::TunnelReady(boxed) => {
+            AppEvent::TunnelReady(boxed, generation) => {
                 let (result, conn) = *boxed;
+                if !self.is_current_generation(generation) {
+                    // 切り替え前の接続のトンネル。使わないので止める
+                    kill_tunnel_in_background(result.ok());
+                    return std::ops::ControlFlow::Continue(());
+                }
                 match result {
                     Ok(tunnel) => {
                         self.active_tunnel = Some(tunnel);
                         self.status_message = Some(format!("トンネル確立: {}", conn.name()));
                         // トンネル経由でスキーマ取得
-                        spawn_fetch_tables(&conn, self.resolved_password.clone(), self.tx.clone());
+                        spawn_fetch_tables(&conn, self.resolved_password.clone(), generation, self.tx.clone());
                     }
                     Err(e) => {
                         self.status_message = Some(format!("トンネルエラー: {}", e));
@@ -750,7 +816,10 @@ impl App {
                 }
                 std::ops::ControlFlow::Continue(())
             }
-            AppEvent::TablesLoaded(result) => {
+            AppEvent::TablesLoaded(result, generation) => {
+                if !self.is_current_generation(generation) {
+                    return std::ops::ControlFlow::Continue(());
+                }
                 self.schema.loading = false;
                 match result {
                     Ok(tables) => {
@@ -774,7 +843,12 @@ impl App {
                 }
                 std::ops::ControlFlow::Continue(())
             }
-            AppEvent::QueryCompleted(result, auto_limited, original_query, tab_id) => {
+            AppEvent::QueryCompleted(result, auto_limited, original_query, tab_id, generation) => {
+                // 切り替え前の接続で実行したクエリの結果は、表示も履歴への記録もしない。
+                // タブを展開し直すと tab_id が振り直されるので、別のタブに入ってしまう
+                if !self.is_current_generation(generation) {
+                    return std::ops::ControlFlow::Continue(());
+                }
                 // tab_id で対象タブを特定（閉じられていたら破棄）
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     tab.editor.executing = false;
@@ -832,7 +906,11 @@ impl App {
                 }
                 std::ops::ControlFlow::Continue(())
             }
-            AppEvent::ColumnsLoaded(table_name, result) => {
+            AppEvent::ColumnsLoaded(table_name, result, generation) => {
+                // テーブル名だけで照合するので、切り替え前の接続のカラムが同名テーブルに入ってしまう
+                if !self.is_current_generation(generation) {
+                    return std::ops::ControlFlow::Continue(());
+                }
                 if let Some(table) = self.schema.tables.iter_mut().find(|t| t.name == table_name) {
                     table.columns_loading = false;
                     match result {
@@ -891,6 +969,7 @@ impl App {
             &conn,
             &table_name,
             self.resolved_password.clone(),
+            self.active_generation(),
             self.tx.clone(),
         );
     }
@@ -989,43 +1068,8 @@ impl App {
                     return std::ops::ControlFlow::Continue(());
                 }
                 if let Some(conn) = self.connections.get(self.picker_cursor).cloned() {
-                    // パスワード解決（prompt は TUI では入力できないのでエラーになる）
-                    let password = match conn.resolve_password_in_tui() {
-                        Ok(pw) => pw,
-                        Err(e) => {
-                            self.status_message = Some(format!("パスワードエラー: {}", e));
-                            return std::ops::ControlFlow::Continue(());
-                        }
-                    };
-                    self.resolved_password = password;
-
-                    // 前のトンネルを取り出す。新しい接続もトンネルなら、spawn_tunnel が終了を待ってから起動する
-                    let old_tunnel = self.active_tunnel.take();
-                    // セッション切り替え: 直前の接続のタブを退避し、新接続のタブを展開する。
-                    // 同じ接続を再選択した場合は何もしない（タブをそのまま維持）。
-                    let prev_name = self
-                        .active_connection
-                        .as_ref()
-                        .map(|c| c.name.clone());
-                    if prev_name.as_deref() != Some(conn.name()) {
-                        self.switch_connection_session(prev_name.as_deref(), conn.name());
-                    }
-                    self.active_connection = Some(ActiveConnectionInfo::new(&conn));
-                    self.mode = AppMode::Normal;
-                    // 結果セットはクエリ再実行が必要なのでクリア（editor は session で復元済み）
-                    self.tabs.iter_mut().for_each(|t| t.results.clear());
-                    self.schema = SchemaState::new();
-                    self.schema.loading = true;
-                    match &conn {
-                        ConnectionConfig::Direct(_) | ConnectionConfig::Sqlite(_) => {
-                            kill_tunnel_in_background(old_tunnel);
-                            self.status_message = Some(format!("接続中: {}...", conn.name()));
-                            spawn_fetch_tables(&conn, self.resolved_password.clone(), self.tx.clone());
-                        }
-                        ConnectionConfig::Ssh(_) | ConnectionConfig::Ssm(_) => {
-                            self.status_message = Some(format!("トンネル確立中: {}...", conn.name()));
-                            spawn_tunnel(conn, old_tunnel, self.tx.clone());
-                        }
+                    if let Err(e) = self.start_connection(conn) {
+                        self.status_message = Some(format!("パスワードエラー: {}", e));
                     }
                 }
             }
@@ -1288,7 +1332,7 @@ impl App {
                     match result {
                         schema::ToggleResult::NeedFetchColumns(table_name) => {
                             if let Some(conn) = self.active_config().cloned() {
-                                spawn_fetch_columns(&conn, &table_name, self.resolved_password.clone(), self.tx.clone());
+                                spawn_fetch_columns(&conn, &table_name, self.resolved_password.clone(), self.active_generation(), self.tx.clone());
                             }
                         }
                     }
@@ -1324,7 +1368,7 @@ impl App {
                     self.schema = SchemaState::new();
                     self.schema.loading = true;
                     self.status_message = Some("スキーマ再読み込み中...".to_string());
-                    spawn_fetch_tables(&conn, self.resolved_password.clone(), self.tx.clone());
+                    spawn_fetch_tables(&conn, self.resolved_password.clone(), self.active_generation(), self.tx.clone());
                 }
             }
             _ => {}
@@ -1852,12 +1896,23 @@ impl App {
                                         Some("編集対象が見つかりませんでした".to_string());
                                     return std::ops::ControlFlow::Continue(());
                                 }
+                                let old_name = self.connections[idx].name().to_string();
                                 self.connections[idx] = conn.clone();
                                 if let Err(e) =
                                     save_all_connections(&self.connections_path, &self.connections)
                                 {
                                     self.status_message = Some(format!("保存エラー: {}", e));
                                     return std::ops::ControlFlow::Continue(());
+                                }
+                                // 接続中の接続を改名したら、接続中の名前も変える。セッションのキーはこの名前なので、
+                                // 旧名のままだと新名で Enter したときに切替とみなされ、タブが旧名に退避される。
+                                // 接続先（config）と readonly は接続時のまま。新しい設定は Enter で繋ぎ直すと効く
+                                if let Some(active) = self
+                                    .active_connection
+                                    .as_mut()
+                                    .filter(|c| c.name == old_name)
+                                {
+                                    active.name = conn.name().to_string();
                                 }
                                 self.picker_cursor = idx;
                                 self.mode = AppMode::ConnectionPicker;
@@ -1874,44 +1929,14 @@ impl App {
                                 self.connections.push(conn.clone());
                                 self.picker_cursor = self.connections.len() - 1;
                                 // パスワードを解決できなければ、保存だけしてピッカーに戻る
-                                self.resolved_password = match conn.resolve_password_in_tui() {
-                                    Ok(pw) => pw,
-                                    Err(e) => {
-                                        self.mode = AppMode::ConnectionPicker;
-                                        self.status_message = Some(format!(
-                                            "接続を保存しました: {}。パスワードエラー: {}",
-                                            conn.name(),
-                                            e
-                                        ));
-                                        return std::ops::ControlFlow::Continue(());
-                                    }
-                                };
-                                self.active_connection = Some(ActiveConnectionInfo::new(&conn));
-                                self.mode = AppMode::Normal;
-                                // 接続切り替え時: 全タブの results をクリア（editor は保持）
-                                self.tabs.iter_mut().for_each(|t| t.results.clear());
-                                self.schema = SchemaState::new();
-                                self.schema.loading = true;
-
-                                // 前のトンネルを止める。残したままだと、同じ local_port の
-                                // 新しいトンネルが起動できず、クエリも旧トンネルの先へ届く
-                                let old_tunnel = self.active_tunnel.take();
-                                match &conn {
-                                    ConnectionConfig::Direct(_) | ConnectionConfig::Sqlite(_) => {
-                                        kill_tunnel_in_background(old_tunnel);
-                                        self.status_message =
-                                            Some(format!("接続中: {}...", conn.name()));
-                                        spawn_fetch_tables(
-                                            &conn,
-                                            self.resolved_password.clone(),
-                                            self.tx.clone(),
-                                        );
-                                    }
-                                    ConnectionConfig::Ssh(_) | ConnectionConfig::Ssm(_) => {
-                                        self.status_message =
-                                            Some(format!("トンネル確立中: {}...", conn.name()));
-                                        spawn_tunnel(conn, old_tunnel, self.tx.clone());
-                                    }
+                                let name = conn.name().to_string();
+                                if let Err(e) = self.start_connection(conn) {
+                                    self.mode = AppMode::ConnectionPicker;
+                                    self.status_message = Some(format!(
+                                        "接続を保存しました: {}。パスワードエラー: {}",
+                                        name, e
+                                    ));
+                                    return std::ops::ControlFlow::Continue(());
                                 }
                             }
                         }
@@ -2287,7 +2312,7 @@ impl App {
         if let Some(conn) = self.active_config().cloned() {
             self.tabs[idx].editor.executing = true;
             self.status_message = Some("クエリ実行中...".to_string());
-            spawn_execute_query(&conn, &final_query, auto_limited, &query, tab_id, self.resolved_password.clone(), self.tx.clone());
+            spawn_execute_query(&conn, &final_query, auto_limited, &query, tab_id, self.resolved_password.clone(), self.active_generation(), self.tx.clone());
         } else {
             self.status_message = Some("接続が選択されていません".to_string());
         }
@@ -2335,7 +2360,12 @@ fn kill_tunnel_in_background(tunnel: Option<Tunnel>) {
 }
 
 /// `old_tunnel` の終了を待ってから `conn` のトンネルを起動する
-fn spawn_tunnel(conn: ConnectionConfig, old_tunnel: Option<Tunnel>, tx: mpsc::Sender<AppEvent>) {
+fn spawn_tunnel(
+    conn: ConnectionConfig,
+    old_tunnel: Option<Tunnel>,
+    generation: u64,
+    tx: mpsc::Sender<AppEvent>,
+) {
     tokio::spawn(async move {
         let start = async {
             match &conn {
@@ -2367,23 +2397,34 @@ fn spawn_tunnel(conn: ConnectionConfig, old_tunnel: Option<Tunnel>, tx: mpsc::Se
             }
         };
         let result = crate::tunnel::replace(old_tunnel, start).await;
-        let _ = tx.send(AppEvent::TunnelReady(Box::new((result, conn)))).await;
+        let _ = tx.send(AppEvent::TunnelReady(Box::new((result, conn)), generation)).await;
     });
 }
 
-fn spawn_fetch_tables(conn: &ConnectionConfig, password: Option<String>, tx: mpsc::Sender<AppEvent>) {
+fn spawn_fetch_tables(
+    conn: &ConnectionConfig,
+    password: Option<String>,
+    generation: u64,
+    tx: mpsc::Sender<AppEvent>,
+) {
     if let Some(mut adapter) = build_adapter(conn, password) {
         tokio::spawn(async move {
             let result = match adapter.connect().await {
                 Ok(()) => adapter.fetch_tables().await,
                 Err(e) => Err(e),
             };
-            let _ = tx.send(AppEvent::TablesLoaded(result)).await;
+            let _ = tx.send(AppEvent::TablesLoaded(result, generation)).await;
         });
     }
 }
 
-fn spawn_fetch_columns(conn: &ConnectionConfig, table_name: &str, password: Option<String>, tx: mpsc::Sender<AppEvent>) {
+fn spawn_fetch_columns(
+    conn: &ConnectionConfig,
+    table_name: &str,
+    password: Option<String>,
+    generation: u64,
+    tx: mpsc::Sender<AppEvent>,
+) {
     if let Some(mut adapter) = build_adapter(conn, password) {
         let table = table_name.to_string();
         tokio::spawn(async move {
@@ -2391,11 +2432,12 @@ fn spawn_fetch_columns(conn: &ConnectionConfig, table_name: &str, password: Opti
                 Ok(()) => adapter.fetch_columns(&table).await,
                 Err(e) => Err(e),
             };
-            let _ = tx.send(AppEvent::ColumnsLoaded(table, result)).await;
+            let _ = tx.send(AppEvent::ColumnsLoaded(table, result, generation)).await;
         });
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_execute_query(
     conn: &ConnectionConfig,
     query: &str,
@@ -2403,6 +2445,7 @@ fn spawn_execute_query(
     original_query: &str,
     tab_id: usize,
     password: Option<String>,
+    generation: u64,
     tx: mpsc::Sender<AppEvent>,
 ) {
     if let Some(mut adapter) = build_adapter(conn, password) {
@@ -2413,7 +2456,9 @@ fn spawn_execute_query(
                 Ok(()) => adapter.execute(&query).await,
                 Err(e) => Err(e),
             };
-            let _ = tx.send(AppEvent::QueryCompleted(result, auto_limited, original, tab_id)).await;
+            let _ = tx
+                .send(AppEvent::QueryCompleted(result, auto_limited, original, tab_id, generation))
+                .await;
         });
     }
 }
@@ -2600,35 +2645,10 @@ pub async fn run(
         if let Some(idx) = app.connections.iter().position(|c| c.name() == conn_name) {
             app.picker_cursor = idx;
             let conn = app.connections[idx].clone();
-            // パスワードを解決できなければ自動接続せず、ピッカーのままエラーを表示する
-            match conn.resolve_password_in_tui() {
-                Err(e) => {
-                    app.status_message = Some(format!("パスワードエラー: {}", e));
-                }
-                Ok(password) => {
-                    app.resolved_password = password;
-                    // 自動接続の場合も保存済みタブを展開する（初回接続なので prev は None）
-                    app.switch_connection_session(None, conn.name());
-                    app.active_connection = Some(ActiveConnectionInfo::new(&conn));
-                    app.mode = AppMode::Normal;
-                    app.schema = SchemaState::new();
-                    app.schema.loading = true;
-                    match &conn {
-                        ConnectionConfig::Direct(_) | ConnectionConfig::Sqlite(_) => {
-                            app.status_message = Some(format!("接続中: {}...", conn.name()));
-                            spawn_fetch_tables(
-                                &conn,
-                                app.resolved_password.clone(),
-                                app.tx.clone(),
-                            );
-                        }
-                        ConnectionConfig::Ssh(_) | ConnectionConfig::Ssm(_) => {
-                            app.status_message =
-                                Some(format!("トンネル確立中: {}...", conn.name()));
-                            spawn_tunnel(conn, None, app.tx.clone());
-                        }
-                    }
-                }
+            // パスワードを解決できなければ自動接続せず、ピッカーのままエラーを表示する。
+            // 自動接続でも保存済みタブを展開する（初回接続なので退避する前の接続は無い）
+            if let Err(e) = app.start_connection(conn) {
+                app.status_message = Some(format!("パスワードエラー: {}", e));
             }
         }
     }

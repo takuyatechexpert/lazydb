@@ -1082,3 +1082,228 @@ async fn main_loop_error_still_saves_session() {
         .expect("接続 a のセッションが保存されていない");
     assert_eq!(session.tabs[0].content, "SELECT 'b14'");
 }
+
+// ── 接続の開始: ウィザード保存・改名でもタブの退避先が接続とずれない ──
+
+/// 接続 a だけを書いた接続設定ファイルを一時ディレクトリに作り、それを読み込んだ App を返す。
+/// a は開けない DB にしておく（接続を始めても DB ファイルを作らない）
+fn app_with_connections_file() -> (App, PathBuf) {
+    use crate::config::connections::load_connections;
+
+    let dir = std::env::temp_dir().join(format!("lazydb_test_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("connections.yml");
+    std::fs::write(
+        &path,
+        "- type: sqlite\n  name: a\n  path: /nonexistent-lazydb-test/a.db\n",
+    )
+    .unwrap();
+    let (tx, _rx) = mpsc::channel(10);
+    let app = App::new(
+        load_connections(&path).unwrap(),
+        path,
+        AppConfig::default(),
+        tx,
+    );
+    (app, dir)
+}
+
+#[tokio::test]
+async fn wizard_save_stashes_previous_connection_tabs() {
+    let (mut app, dir) = app_with_connections_file();
+
+    // a に接続してクエリを書く → ピッカーで a を複製して保存（a-copy に接続する）
+    let _ = app.handle_key(key(KeyCode::Enter));
+    let idx = app.active_tab;
+    app.tabs[idx].editor.set_content("SELECT 'a'");
+    let _ = app.handle_key(ctrl_key('c'));
+    let _ = app.handle_key(key(KeyCode::Char('d')));
+    app.new_conn_form.cursor = 2; // name 行
+    let _ = app.handle_key(key(KeyCode::Enter));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        app.active_connection.as_ref().map(|c| c.name.as_str()),
+        Some("a-copy"),
+        "status: {:?}",
+        app.status_message
+    );
+    // a のタブは a に退避され、a-copy は空のタブで始まる
+    let stashed = app.session_state.get("a").expect("a のタブが退避されていない");
+    assert_eq!(stashed.tabs[0].content, "SELECT 'a'");
+    assert_eq!(app.tabs.len(), 1);
+    assert_eq!(app.tabs[0].editor.lines, vec![String::new()]);
+}
+
+#[tokio::test]
+async fn renaming_active_connection_keeps_its_tabs() {
+    let (mut app, dir) = app_with_connections_file();
+
+    // a に接続してクエリを書く → ピッカーで a を a2 に改名して保存 → a2 に接続
+    let _ = app.handle_key(key(KeyCode::Enter));
+    let idx = app.active_tab;
+    app.tabs[idx].editor.set_content("SELECT 'a'");
+    let _ = app.handle_key(ctrl_key('c'));
+    let _ = app.handle_key(key(KeyCode::Char('e')));
+    app.new_conn_form.cursor = 2; // name 行
+    let _ = app.handle_key(key(KeyCode::Char('2')));
+    let _ = app.handle_key(key(KeyCode::Enter));
+    let _ = app.handle_key(key(KeyCode::Enter));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        app.active_connection.as_ref().map(|c| c.name.as_str()),
+        Some("a2"),
+        "status: {:?}",
+        app.status_message
+    );
+    let idx = app.active_tab;
+    assert_eq!(app.tabs[idx].editor.lines, vec!["SELECT 'a'".to_string()]);
+    assert!(app.session_state.get("a").is_none(), "旧名にタブが退避された");
+}
+
+// ── 接続の世代: 切り替え前の接続が出したイベントは捨てる ──
+
+/// 接続 a に 2 回接続した（同じ接続の選び直しで世代を 1 → 2 に進めた）App を返す
+fn app_reconnected_twice() -> App {
+    let (tx, _rx) = mpsc::channel(10);
+    let connections_path = PathBuf::from("/nonexistent-lazydb-test/connections.yml");
+    let mut app = App::new(
+        vec![sqlite_conn("a", "/nonexistent-lazydb-test/a.db", false)],
+        connections_path,
+        AppConfig::default(),
+        tx,
+    );
+    let _ = app.handle_key(key(KeyCode::Enter));
+    let _ = app.handle_key(ctrl_key('c'));
+    let _ = app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.active_connection.as_ref().map(|c| c.generation), Some(2));
+    app
+}
+
+fn tables(names: &[&str]) -> Result<Vec<TableInfo>> {
+    Ok(names
+        .iter()
+        .map(|n| TableInfo {
+            name: n.to_string(),
+        })
+        .collect())
+}
+
+#[tokio::test]
+async fn tables_loaded_from_previous_generation_is_discarded() {
+    let mut app = app_reconnected_twice();
+
+    let _ = app.handle_event(AppEvent::TablesLoaded(tables(&["old"]), 1));
+    assert!(app.schema.tables.is_empty());
+    assert!(app.schema.loading, "古い結果で読み込み中の表示が消えた");
+
+    let _ = app.handle_event(AppEvent::TablesLoaded(tables(&["new"]), 2));
+    let names: Vec<&str> = app.schema.tables.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["new"]);
+}
+
+#[tokio::test]
+async fn columns_loaded_from_previous_generation_is_discarded() {
+    let mut app = app_reconnected_twice();
+    let _ = app.handle_event(AppEvent::TablesLoaded(tables(&["t"]), 2));
+    app.schema.tables[0].columns_loading = true;
+    let columns = || {
+        Ok(vec![ColumnInfo {
+            name: "id".to_string(),
+            col_type: "INTEGER".to_string(),
+            is_primary_key: true,
+        }])
+    };
+
+    let _ = app.handle_event(AppEvent::ColumnsLoaded("t".to_string(), columns(), 1));
+    assert!(!app.schema.tables[0].columns_loaded);
+
+    let _ = app.handle_event(AppEvent::ColumnsLoaded("t".to_string(), columns(), 2));
+    assert!(app.schema.tables[0].columns_loaded);
+}
+
+#[tokio::test]
+async fn query_completed_from_previous_generation_is_discarded() {
+    let mut app = app_reconnected_twice();
+    let tab_id = app.tabs[app.active_tab].id;
+    let failed = |msg: &str| Err(anyhow::anyhow!(msg.to_string()));
+
+    let _ = app.handle_event(AppEvent::QueryCompleted(failed("old"), false, "SELECT 1".to_string(), tab_id, 1));
+    assert!(matches!(app.tabs[app.active_tab].results.status, results::ResultStatus::Empty));
+
+    let _ = app.handle_event(AppEvent::QueryCompleted(failed("new"), false, "SELECT 1".to_string(), tab_id, 2));
+    assert!(matches!(
+        &app.tabs[app.active_tab].results.status,
+        results::ResultStatus::Error(msg) if msg == "new"
+    ));
+}
+
+#[tokio::test]
+async fn tunnel_ready_from_previous_generation_is_killed() {
+    let mut app = app_reconnected_twice();
+    let child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap().to_string();
+    let tunnel = Tunnel::Ssh(crate::tunnel::ssh::SshTunnel::from_child(child));
+    let conn = sqlite_conn("a", "/nonexistent-lazydb-test/a.db", false);
+    let status_before = app.status_message.clone();
+
+    let _ = app.handle_event(AppEvent::TunnelReady(Box::new((Ok(tunnel), conn)), 1));
+
+    assert!(app.active_tunnel.is_none(), "古いトンネルが使われた");
+    assert_eq!(app.status_message, status_before);
+    // 止めるのはバックグラウンドなので、プロセスが消えるまで待つ（kill -0 は残っていれば成功する）
+    let mut alive = true;
+    for _ in 0..50 {
+        alive = std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if !alive {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(!alive, "古いトンネルのプロセスが止まっていない");
+}
+
+#[tokio::test]
+async fn tunnel_error_from_previous_generation_is_ignored() {
+    let mut app = app_reconnected_twice();
+    let conn = sqlite_conn("a", "/nonexistent-lazydb-test/a.db", false);
+    let status_before = app.status_message.clone();
+
+    let _ = app.handle_event(AppEvent::TunnelReady(
+        Box::new((Err(anyhow::anyhow!("old")), conn)),
+        1,
+    ));
+
+    assert_eq!(app.status_message, status_before);
+    assert!(app.schema.loading, "古いエラーで読み込み中の表示が消えた");
+}
+
+#[tokio::test]
+async fn reselecting_connection_clears_executing_flag() {
+    let (tx, _rx) = mpsc::channel(10);
+    let connections_path = PathBuf::from("/nonexistent-lazydb-test/connections.yml");
+    let mut app = App::new(
+        vec![sqlite_conn("a", "/nonexistent-lazydb-test/a.db", false)],
+        connections_path,
+        AppConfig::default(),
+        tx,
+    );
+    let _ = app.handle_key(key(KeyCode::Enter));
+    // クエリの実行中に、同じ接続を選び直す。実行中のクエリの結果は世代が古くなって捨てられる
+    let idx = app.active_tab;
+    app.tabs[idx].editor.executing = true;
+    let _ = app.handle_key(ctrl_key('c'));
+    let _ = app.handle_key(key(KeyCode::Enter));
+
+    assert!(!app.tabs[idx].editor.executing, "実行中のまま残り、次のクエリを実行できない");
+}
